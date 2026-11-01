@@ -3,9 +3,13 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/后台文案清单.md
 !/SECURITY.md
 !/*.cs
 !/*.csproj
+!/*.js
+!/admin.css
+!/admin-logo.png
 !/appsettings.example.json
 !/deploy/
 /deploy/*
@@ -16,6 +20,9 @@
 !/tests/PclCmu.Admin.Tests/
 /tests/PclCmu.Admin.Tests/*
 !/tests/PclCmu.Admin.Tests/Program.cs
+!/tests/PclCmu.Admin.Tests/*.cs
+!/tests/PclCmu.Admin.Tests/*.cjs
+!/tests/PclCmu.Admin.Tests/*.sh
 !/tests/PclCmu.Admin.Tests/PclCmu.Admin.Tests.csproj
 
 # Defense in depth: never version credentials, private material or runtime data.

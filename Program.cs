@@ -30,6 +30,10 @@ var adminPort = ParseInt(config["AdminPort"], 9443);
 var dataDir = config["DataDir"] ?? "/opt/pcl-cmu/data";
 var wwwrootDir = config["WwwRoot"] ?? "/opt/pcl-cmu/wwwroot";
 var manifestSigningKeyPath = config["ManifestSigningKeyPath"] ?? "/opt/pcl-cmu/keys/manifest-signing-key.pem";
+var privatePath = Path.GetFullPath(dataDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+var publicPath = Path.GetFullPath(wwwrootDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+if (privatePath.StartsWith(publicPath, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+    throw new ArgumentException("DataDir must be outside WwwRoot; upload sessions are private.");
 
 // Allow large pack uploads (2 GiB) plus multipart boundary overhead.
 builder.WebHost.ConfigureKestrel(options =>
@@ -42,9 +46,19 @@ builder.Services.Configure<FormOptions>(options =>
     options.MultipartBodyLengthLimit = uploadLimitBytes;
 });
 
-var app = builder.Build();
-
+Directory.CreateDirectory(dataDir);
+// This deployment uses file-backed state: two processes must never write it.
+using var writerLease = new FileStream(Path.Combine(dataDir, "writer.lock"), FileMode.OpenOrCreate,
+    FileAccess.ReadWrite, FileShare.None);
 var store = new InstanceStore(dataDir, wwwrootDir, publicBaseUrl, manifestSigningKeyPath);
+var publisher = new PackPublishService(store, uploadLimitBytes);
+var chunkOptions = new ChunkUploadOptions { MaxFileBytes = uploadLimitBytes };
+config.GetSection("ChunkUpload").Bind(chunkOptions);
+chunkOptions.MaxFileBytes = Math.Min(chunkOptions.MaxFileBytes, uploadLimitBytes);
+var uploads = new ChunkUploadService(dataDir, wwwrootDir, store, publisher, chunkOptions);
+builder.Services.AddSingleton(uploads);
+builder.Services.AddHostedService(services => services.GetRequiredService<ChunkUploadService>());
+var app = builder.Build();
 var auth = new AuthService();
 var adminPasswordHash = Environment.GetEnvironmentVariable("PCL_CMU_ADMIN_PASSWORD_HASH");
 
@@ -54,6 +68,13 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Content-Type-Options"] = "nosniff";
     context.Response.Headers["X-Frame-Options"] = "DENY";
     context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    if (store.RecoveryRequired)
+    {
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        context.Response.Headers["Cache-Control"] = "no-store";
+        await context.Response.WriteAsync("Publication recovery required. Check server storage and restart.");
+        return;
+    }
     await next(context);
 });
 
@@ -79,7 +100,18 @@ app.Use(async (context, next) =>
 {
     if (context.Connection.LocalPort == adminPort)
     {
-        await AdminRouter.HandleAsync(context, store, auth, adminPasswordHash, uploadLimitBytes, wwwrootDir);
+        var remote = context.Connection.RemoteIpAddress;
+        if (remote is null || !IPAddress.IsLoopback(remote.IsIPv4MappedToIPv6 ? remote.MapToIPv4() : remote))
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+        if (context.Request.Path.StartsWithSegments("/admin/api/uploads"))
+        {
+            await UploadApi.HandleAsync(context, uploads, auth, isAdmin: true);
+            return;
+        }
+        await AdminRouter.HandleAsync(context, store, auth, adminPasswordHash, uploadLimitBytes, wwwrootDir, publisher, chunkOptions.ChunkSizeBytes);
         return;
     }
 
@@ -92,6 +124,11 @@ app.Use(async (context, next) =>
     if (context.Request.Path.StartsWithSegments("/admin"))
     {
         context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+    if (context.Request.Path.StartsWithSegments("/api/uploads"))
+    {
+        await UploadApi.HandleAsync(context, uploads, auth, isAdmin: false);
         return;
     }
 
@@ -114,7 +151,10 @@ app.UseStaticFiles(new StaticFileOptions
     {
         var path = ctx.Context.Request.Path.Value ?? string.Empty;
 
-        if (path.StartsWith("/packs/", StringComparison.OrdinalIgnoreCase))
+        if (path.StartsWith("/packs/", StringComparison.OrdinalIgnoreCase)
+            || System.Text.RegularExpressions.Regex.IsMatch(path, @"^/icons/[a-f0-9]{64}\.(?:png|jpg)$")
+            || System.Text.RegularExpressions.Regex.IsMatch(path,
+                @"^/update/windows-x86_64/[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?\.zip$"))
             ctx.Context.Response.Headers["Cache-Control"] = "public, max-age=31536000, immutable";
         else
             ctx.Context.Response.Headers["Cache-Control"] = "no-cache";

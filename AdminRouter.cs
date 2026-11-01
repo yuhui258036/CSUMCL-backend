@@ -1,9 +1,9 @@
-using System.IO.Compression;
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using Microsoft.Extensions.Primitives;
+using Microsoft.AspNetCore.Http.Features;
 
 namespace PclCmu.Admin;
 
@@ -24,7 +24,7 @@ public static class AdminRouter
         AuthService auth,
         string? passwordHash,
         long uploadLimitBytes,
-        string wwwrootDir)
+        string wwwrootDir, PackPublishService publisher, int chunkSize = 2 * 1024 * 1024)
     {
         var path = context.Request.Path.Value ?? "/";
         var method = context.Request.Method;
@@ -61,14 +61,30 @@ public static class AdminRouter
             return;
         }
 
-        // ---- Everything below requires a valid session --------------------
-        if (!auth.IsAuthenticated(context))
+        // Only fixed, non-sensitive presentation assets are available before login.
+        if (path is "/admin/assets/upload.js" or "/admin/assets/sha256-worker.js"
+            or "/admin/assets/upload-background.js" or "/admin/assets/admin-navigation.js"
+            or "/admin/assets/admin.js" or "/admin/assets/admin-validation.js" or "/admin/assets/admin.css" or "/admin/assets/admin-logo.png")
         {
-            Redirect(context, "/admin/login");
+            if (method != "GET") { await MethodNotAllowedAsync(context); return; }
+            if (path.EndsWith("upload.js") || path.EndsWith("sha256-worker.js") || path.EndsWith("upload-background.js") || path.EndsWith("admin-navigation.js"))
+                if (!auth.IsAuthenticated(context)) { Redirect(context, "/admin/login"); return; }
+            context.Response.ContentType = path.EndsWith(".css") ? "text/css; charset=utf-8"
+                : path.EndsWith(".png") ? "image/png" : "text/javascript; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            await using var asset = typeof(AdminRouter).Assembly.GetManifestResourceStream("PclCmu.Admin." + Path.GetFileName(path))!;
+            await asset.CopyToAsync(context.Response.Body, context.RequestAborted);
+            return;
+        }
+        if (!auth.IsAuthenticated(context)) { Redirect(context, "/admin/login"); return; }
+
+        if (path == "/admin/instances/reorder")
+        {
+            if (method != "POST") { await MethodNotAllowedAsync(context); return; }
+            await PostReorderAsync(context, auth, store);
             return;
         }
 
-        // ---- Dashboard -----------------------------------------------------
         if (path == "/admin" || path == "/admin/")
         {
             if (method == "GET")
@@ -105,7 +121,7 @@ public static class AdminRouter
 
             if (method == "POST")
             {
-                await PostNewInstanceAsync(context, auth, store);
+                await PostNewInstanceAsync(context, auth, store, wwwrootDir);
                 return;
             }
 
@@ -125,13 +141,13 @@ public static class AdminRouter
                 {
                     if (method == "GET")
                     {
-                        await GetUploadFormAsync(context, auth, store, id);
+                        await GetUploadFormAsync(context, auth, store, id, chunkSize, uploadLimitBytes);
                         return;
                     }
 
                     if (method == "POST")
                     {
-                        await PostUploadAsync(context, auth, store, id, uploadLimitBytes, wwwrootDir);
+                        await PostUploadAsync(context, auth, store, id, uploadLimitBytes, wwwrootDir, publisher);
                         return;
                     }
 
@@ -150,7 +166,7 @@ public static class AdminRouter
 
                 if (method == "POST")
                 {
-                    await PostEditAsync(context, auth, store, id);
+                    await PostEditAsync(context, auth, store, id, wwwrootDir);
                     return;
                 }
 
@@ -174,21 +190,21 @@ public static class AdminRouter
 
         var csrf = auth.EnsureCsrfCookie(context);
         var notice = string.IsNullOrWhiteSpace(passwordHash)
-            ? "<p class=\"err\">Admin password is not configured. Set the PCL_CMU_ADMIN_PASSWORD_HASH environment variable.</p>"
+            ? "<p class=\"err\">尚未配置管理员密码，请联系后台维护人员完成设置。</p>"
             : "";
         var err = error is null ? "" : $"<p class=\"err\">{H(error)}</p>";
 
         var content = $$"""
-{{notice}}
+<div class="panel">{{notice}}
 {{err}}
-<form method="post" action="/admin/login">
+<form novalidate method="post" action="/admin/login">
   <input type="hidden" name="_csrf" value="{{H(csrf)}}">
-  <label>Password <input type="password" name="password" autofocus required></label>
-  <div class="actions"><button type="submit">Log in</button></div>
+  <label>管理员密码 <input type="password" name="password" autocomplete="current-password" autofocus required placeholder="请输入管理员密码"></label>
+  <div class="actions"><button type="submit">登录</button></div>
 </form>
 """;
 
-        await WriteHtmlAsync(context, Layout("Admin login", content));
+        await WriteHtmlAsync(context, Layout("后台登录", content + "</div>"));
     }
 
     private static async Task PostLoginAsync(HttpContext context, AuthService auth, string? passwordHash)
@@ -214,8 +230,8 @@ public static class AdminRouter
             auth,
             passwordHash,
             string.IsNullOrWhiteSpace(passwordHash)
-                ? "Admin password is not configured."
-                : "Invalid password.");
+                ? "尚未配置管理员密码。"
+                : "密码不正确，请重新输入。");
     }
 
     private static async Task PostLogoutAsync(HttpContext context, AuthService auth)
@@ -238,54 +254,74 @@ public static class AdminRouter
         var csrf = auth.EnsureCsrfCookie(context);
         var rows = new StringBuilder();
 
-        foreach (var i in store.List())
+        var instances = store.List();
+        foreach (var i in instances)
         {
             var idEnc = Uri.EscapeDataString(i.Id);
-            var size = i.Pack is null ? "—" : i.Pack.Size.ToString();
-            var server = i.Server is null
-                ? "—"
-                : $"{H(i.Server.Address)}:{i.Server.Port}";
-
-            rows.Append("<tr>");
-            rows.Append($"<td><a href=\"/admin/instances/{idEnc}\">{H(i.Id)}</a></td>");
-            rows.Append($"<td>{H(i.Name)}</td>");
-            rows.Append($"<td>{i.Revision}</td>");
-            rows.Append($"<td>{size}</td>");
-            rows.Append($"<td>{(i.Required ? "yes" : "no")}</td>");
-            rows.Append($"<td>{server}</td>");
-            rows.Append($"<td><a href=\"/admin/instances/{idEnc}/upload\">upload</a> · <a href=\"/admin/instances/{idEnc}\">edit</a></td>");
-            rows.Append("</tr>");
+            var published = i.Pack is not null;
+            var version = i.Minecraft?.GameVersion;
+            rows.Append($"<article class=\"instance-card\" data-instance-id=\"{H(i.Id)}\" aria-label=\"{H(i.Name)}\">");
+            rows.Append($"<button type=\"button\" class=\"drag-handle\" aria-label=\"排序：{H(i.Name)}\" title=\"拖拽排序；方向键上移或下移\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M8 5h.01M16 5h.01M8 12h.01M16 12h.01M8 19h.01M16 19h.01\"/></svg></button>");
+            var iconSource = Uri.TryCreate(i.IconUrl, UriKind.Absolute, out var iconUri) && iconUri.Scheme is "http" or "https" ? iconUri.AbsoluteUri : "";
+            rows.Append($"<div class=\"pack-icon\"><span class=\"icon-placeholder\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\"><rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"3\"/><path d=\"m4 16 5-5 4 4 3-3 4 4\"/></svg></span>{(iconSource.Length == 0 ? "" : $"<img class=\"pack-icon-image\" src=\"{H(iconSource)}\" alt=\"\" referrerpolicy=\"no-referrer\" decoding=\"async\" loading=\"lazy\" hidden>")}</div>");
+            rows.Append($"<div class=\"instance-name\"><span class=\"card-label\">名称 / 标识</span><strong>{H(i.Name)}</strong><small>{H(i.Id)}</small></div>");
+            rows.Append($"<div><span class=\"card-label\">游戏 / 加载器</span>{H(string.IsNullOrWhiteSpace(version) ? "待上传后识别" : version)}<small>{H(i.Minecraft?.Loader)} {H(i.Minecraft?.LoaderVersion)}</small></div>");
+            rows.Append($"<div><span class=\"card-label\">大小 / 版本</span>{(published ? FormatSize(i.Pack!.Size) : "—")}<small>版本 {i.Revision}</small></div>");
+            rows.Append($"<div><span class=\"card-label\">必须</span>{(i.Required ? "是" : "否")}</div>");
+            rows.Append($"<div><span class=\"card-label\">发布状态</span><span class=\"tag {(published ? "success" : "pending")}\">{(published ? "已发布" : "待发布")}</span></div>");
+            rows.Append($"<div class=\"table-actions\"><a class=\"button secondary small\" href=\"/admin/instances/{idEnc}/upload\">上传新版本</a><a class=\"quiet small\" href=\"/admin/instances/{idEnc}\">编辑</a></div></article>");
         }
-
         var content = $$"""
-<p>
-  <a href="/admin/instances/new">New instance</a> ·
-  <a href="/admin/manifest">View manifest</a>
-  <form method="post" action="/admin/logout" style="display:inline; margin-left:1rem;">
-    <input type="hidden" name="_csrf" value="{{H(csrf)}}">
-    <button type="submit">Log out</button>
-  </form>
-</p>
-<table>
-<thead><tr><th>ID</th><th>Name</th><th>Revision</th><th>Size</th><th>Required</th><th>Server</th><th>Actions</th></tr></thead>
-<tbody>
-{{rows}}
-</tbody>
-</table>
-""";
+<div class="stats">
+ <div class="stat"><span>整合包</span><strong>{{instances.Count}} <small>个</small></strong></div>
+ <div class="stat"><span>已发布</span><strong>{{instances.Count(i => i.Pack is not null)}} <small>个</small></strong></div>
+ <div class="stat"><span>当前版本资源体积</span><strong>{{FormatSize(instances.Sum(i => i.Pack?.Size ?? 0))}}</strong></div>
+</div>
+<section class="instance-section"><div class="panel-title"><h2>整合包</h2><a class="button" href="/admin/instances/new">＋ 新建整合包</a></div>
+<div id="instance-list" data-csrf="{{H(csrf)}}">{{(instances.Count == 0 ? "<div class=\"panel empty\"><h2>还没有整合包</h2></div>" : rows.ToString())}}</div>
+<p id="reorder-status" role="status" aria-live="polite" hidden></p>
+</section>
 
-        await WriteHtmlAsync(context, Layout("Dashboard", content));
+""";
+        await WriteHtmlAsync(context, Layout("整合包管理", content));
     }
 
     // ------------------------------------------------------- Manifest preview
 
     private static async Task GetManifestPreviewAsync(HttpContext context, InstanceStore store)
     {
-        context.Response.StatusCode = StatusCodes.Status200OK;
-        context.Response.ContentType = "application/json; charset=utf-8";
-        context.Response.Headers["Cache-Control"] = "no-store";
-        await context.Response.WriteAsync(store.GetManifestJson());
+        var json = store.GetManifestJson();
+        if (context.Request.Query["format"] == "json")
+        {
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            await context.Response.WriteAsync(json);
+            return;
+        }
+        // Render the same published snapshot served to clients, excluding drafts.
+        var manifest = JsonSerializer.Deserialize<Manifest>(json)!;
+        var rows = new StringBuilder();
+        foreach (var item in manifest.Instances)
+        {
+            var pack = item.Pack;
+            var server = string.IsNullOrWhiteSpace(item.Server?.Address) ? "—" : $"{item.Server.Address}:{item.Server.Port}";
+            rows.Append($"<tr><td><strong>{H(item.Name)}</strong><small>{H(item.Id)}</small></td><td>{item.Revision}</td>");
+            rows.Append($"<td>{H(item.Minecraft?.GameVersion)}<small>{H(item.Minecraft?.Loader)} {H(item.Minecraft?.LoaderVersion)}</small></td>");
+            rows.Append($"<td>{FormatSize(pack?.Size ?? 0)}</td><td>{ResourceLink(pack?.Url, "整合包")}{ResourceLink(pack?.FilesUrl, "文件索引")}</td>");
+            rows.Append($"<td><details class=\"resource-details\"><summary>详情</summary><dl><dt>服务器</dt><dd>{H(server)}</dd><dt>必需</dt><dd>{(item.Required ? "是" : "否")}</dd><dt>SHA-256</dt><dd>{H(pack?.Sha256 ?? "—")}</dd><dt>索引 SHA-256</dt><dd>{H(pack?.FilesSha256 ?? "—")}</dd></dl></details></td></tr>");
+        }
+        var content = $$"""
+<section class="panel manifest-panel">
+ <div class="panel-title"><span class="muted">{{manifest.Instances.Count}} 个资源 · 格式版本 {{manifest.FormatVersion}}</span><a class="button secondary small" href="/admin/manifest?format=json">原始 JSON</a></div>
+ {{(manifest.Instances.Count == 0 ? "<div class=\"empty\">暂无已发布资源</div>" : "<div class=\"table-scroll\"><table><thead><tr><th>名称 / 标识</th><th>版本</th><th>游戏 / 加载器</th><th>大小</th><th>文件</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></div>")}}
+</section>
+""";
+        await WriteHtmlAsync(context, Layout("资源清单", content));
     }
+
+    private static string ResourceLink(string? url, string label)
+        => Uri.TryCreate(url, UriKind.Absolute, out var uri) && (uri.Scheme == "https" || uri.Scheme == "http")
+            ? $"<a class=\"resource-link\" href=\"{H(uri.AbsoluteUri)}\" target=\"_blank\" rel=\"noopener noreferrer\">{H(label)} ↗</a>" : "";
 
     // ----------------------------------------------------------- New instance
 
@@ -306,7 +342,6 @@ public static class AdminRouter
                 ["name"] = instance.Name,
                 ["description"] = instance.Description ?? "",
                 ["icon_url"] = instance.IconUrl ?? "",
-                ["sort"] = instance.Sort?.ToString() ?? "",
                 ["required"] = instance.Required ? "true" : "",
                 ["game_version"] = instance.Minecraft?.GameVersion ?? "",
                 ["loader"] = instance.Minecraft?.Loader ?? "",
@@ -314,7 +349,8 @@ public static class AdminRouter
                 ["server_address"] = instance.Server?.Address ?? "",
                 ["server_port"] = instance.Server?.Port.ToString() ?? "25565",
             }
-            : submitted ?? new Dictionary<string, string>();
+            : new Dictionary<string, string> { ["server_port"] = "25565" };
+        if (submitted is not null) values = submitted;
 
         var err = error is null ? "" : $"<p class=\"err\">{H(error)}</p>";
         var action = isEdit
@@ -322,45 +358,54 @@ public static class AdminRouter
             : "/admin/instances/new";
 
         var idField = isEdit
-            ? $"<input type=\"hidden\" name=\"id\" value=\"{H(values["id"])}\"><p>ID: <strong>{H(values["id"])}</strong></p>"
-            : $"<label>ID <input name=\"id\" required pattern=\"[a-z0-9_-]{{1,64}}\" maxlength=\"64\" value=\"{H(Get(values, "id"))}\" placeholder=\"my-instance\"></label>";
+            ? $"<input type=\"hidden\" name=\"id\" value=\"{H(instance!.Id)}\"><p>整合包标识：<strong>{H(instance!.Id)}</strong></p>"
+            : $"<label>整合包标识 <input name=\"id\" required pattern=\"[a-z0-9_-]{{1,64}}\" maxlength=\"64\" value=\"{H(Get(values, "id"))}\" placeholder=\"my-instance\"></label>";
 
         var content = $$"""
 {{err}}
-<form method="post" action="{{action}}">
+<form novalidate class="panel form-card" method="post" enctype="multipart/form-data" action="{{action}}"><div class="form-grid">
   <input type="hidden" name="_csrf" value="{{H(csrf)}}">
   {{idField}}
-  <label>Name <input name="name" required value="{{H(Get(values, "name"))}}"></label>
-  <label>Description <textarea name="description" rows="3">{{H(Get(values, "description"))}}</textarea></label>
-  <label>Icon URL <input name="icon_url" type="url" value="{{H(Get(values, "icon_url"))}}"></label>
-  <div class="row">
-    <label>Sort <input name="sort" type="number" value="{{H(Get(values, "sort"))}}"></label>
-    <label class="row"><input name="required" type="checkbox" value="true" {{(Get(values, "required") == "true" ? "checked" : "")}}> Required</label>
+  <label>显示名称 <input name="name" required value="{{H(Get(values, "name"))}}"></label>
+  <label class="full">简介 <textarea name="description" rows="3">{{H(Get(values, "description"))}}</textarea></label>
+  <div class="full icon-field">
+    <label for="icon-url">图标（可选）</label>
+    <div class="icon-editor"><div class="pack-icon icon-preview" id="icon-preview" aria-label="图标预览"><span class="icon-placeholder" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m4 16 5-5 4 4 3-3 4 4"/></svg></span><img id="icon-preview-image" alt="图标预览" referrerpolicy="no-referrer" hidden></div><div class="icon-editor-fields">
+    <div class="icon-inputs"><input id="icon-url" name="icon_url" type="url" aria-label="图标网络地址" placeholder="https://" value="{{H(Get(values, "icon_url"))}}">
+      <label class="file-select icon-select"><span class="file-select-button">上传图片</span><span id="icon-file-name">未选择文件</span><input id="icon-file" name="icon_file" type="file" accept="image/png,image/jpeg,.png,.jpg,.jpeg" aria-label="上传图标文件"></label>
+      <button type="button" class="quiet small" id="icon-file-clear" hidden>取消选择</button></div>
+    <small class="field-help">支持PNG / JPG， 最大 2 MiB。</small>
+    </div></div>
+    <span id="icon-preview-status" class="field-help" role="status" hidden></span>
+    <p id="icon-error" class="err" role="alert" hidden></p>
   </div>
   <fieldset>
-    <legend>Minecraft</legend>
-    <label>Game version <input name="game_version" value="{{H(Get(values, "game_version"))}}"></label>
-    <label>Loader <input name="loader" value="{{H(Get(values, "loader"))}}"></label>
-    <label>Loader version <input name="loader_version" value="{{H(Get(values, "loader_version"))}}"></label>
+    <legend>游戏与加载器</legend>
+    <label>游戏版本 <input name="game_version" value="{{H(Get(values, "game_version"))}}"></label>
+    <label>加载器 <input name="loader" value="{{H(Get(values, "loader"))}}"></label>
+    <label>加载器版本 <input name="loader_version" value="{{H(Get(values, "loader_version"))}}"></label>
   </fieldset>
   <fieldset>
-    <legend>Server</legend>
-    <label>Address <input name="server_address" value="{{H(Get(values, "server_address"))}}"></label>
-    <label>Port <input name="server_port" type="number" value="{{H(Get(values, "server_port"))}}"></label>
+    <legend>游戏服务器</legend>
+    <label>服务器地址 <input name="server_address" value="{{H(Get(values, "server_address"))}}"></label>
+    <label>端口 <input name="server_port" type="number" min="1" max="65535" step="1" inputmode="numeric" value="{{H(Get(values, "server_port"))}}"></label>
   </fieldset>
+  </div>
+  <label class="check-row required-field"><input name="required" type="checkbox" value="true" {{(Get(values, "required") == "true" ? "checked" : "")}}> 必需整合包</label>
   <div class="actions">
-    <button type="submit">{{(isEdit ? "Save" : "Create")}}</button>
-    <a href="/admin">Cancel</a>
+    <button type="submit">{{(isEdit ? "保存修改" : "创建整合包")}}</button>
+    <a href="/admin">返回概览</a>
   </div>
 </form>
 """;
 
-        await WriteHtmlAsync(context, Layout(isEdit ? "Edit instance" : "New instance", content));
+        await WriteHtmlAsync(context, Layout(isEdit ? "编辑整合包" : "新建整合包", content), error is null ? 200 : 422);
     }
 
-    private static async Task PostNewInstanceAsync(HttpContext context, AuthService auth, InstanceStore store)
+    private static async Task PostNewInstanceAsync(HttpContext context, AuthService auth, InstanceStore store, string wwwrootDir)
     {
-        var form = await context.Request.ReadFormAsync();
+        var form = await ReadMetadataFormAsync(context);
+        if (form is null) return;
         if (!auth.ValidateCsrf(context, form[AuthService.CsrfFieldName]))
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -372,29 +417,41 @@ public static class AdminRouter
 
         if (!InstanceIdRegex.IsMatch(id))
         {
-            await GetInstanceFormAsync(context, auth, null, "Invalid ID: use 1-64 chars of a-z, 0-9, '-' or '_'.", ToDict(form));
+            await GetInstanceFormAsync(context, auth, null, "标识须为 1–64 位小写字母、数字、短横线或下划线。", ToDict(form));
             return;
         }
 
         if (store.Exists(id))
         {
-            await GetInstanceFormAsync(context, auth, null, $"An instance with ID \"{id}\" already exists.", ToDict(form));
+            await GetInstanceFormAsync(context, auth, null, $"标识 \"{id}\" 已存在，请使用其他标识。", ToDict(form));
             return;
         }
 
         if (name.Length == 0)
         {
-            await GetInstanceFormAsync(context, auth, null, "Name is required.", ToDict(form));
+            await GetInstanceFormAsync(context, auth, null, "请填写显示名称。", ToDict(form));
             return;
         }
 
+        if (!TryParseServerPort(form["server_port"], out var serverPort))
+        {
+            await GetInstanceFormAsync(context, auth, null, "端口须为 1–65535 的整数。", ToDict(form));
+            return;
+        }
+        string? iconUrl;
+        try { iconUrl = await InstanceIcons.ResolveAsync(form, wwwrootDir, store.PublicBaseUrl, context.RequestAborted); }
+        catch (InvalidDataException ex)
+        {
+            context.Response.StatusCode = StatusCodes.Status422UnprocessableEntity;
+            await GetInstanceFormAsync(context, auth, null, ex.Message, ToDict(form));
+            return;
+        }
         var instance = new Instance
         {
             Id = id,
             Name = name,
             Description = NullIfEmpty(form["description"]),
-            IconUrl = NullIfEmpty(form["icon_url"]),
-            Sort = ParseNullableInt(form["sort"]),
+            IconUrl = iconUrl,
             Revision = 0,
             Required = IsChecked(form["required"]),
             Minecraft = new MinecraftInfo
@@ -407,11 +464,11 @@ public static class AdminRouter
             Server = new ServerInfo
             {
                 Address = form["server_address"].ToString().Trim(),
-                Port = ParseInt(form["server_port"], 25565),
+                Port = serverPort,
             },
         };
 
-        store.Create(instance);
+        store.Create(instance, append: true);
         Redirect(context, "/admin");
     }
 
@@ -429,9 +486,10 @@ public static class AdminRouter
         await GetInstanceFormAsync(context, auth, instance, null, null);
     }
 
-    private static async Task PostEditAsync(HttpContext context, AuthService auth, InstanceStore store, string id)
+    private static async Task PostEditAsync(HttpContext context, AuthService auth, InstanceStore store, string id, string wwwrootDir)
     {
-        var form = await context.Request.ReadFormAsync();
+        var form = await ReadMetadataFormAsync(context);
+        if (form is null) return;
         if (!auth.ValidateCsrf(context, form[AuthService.CsrfFieldName]))
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
@@ -448,17 +506,29 @@ public static class AdminRouter
         var name = form["name"].ToString().Trim();
         if (name.Length == 0)
         {
-            await GetInstanceFormAsync(context, auth, existing, "Name is required.", ToDict(form));
+            await GetInstanceFormAsync(context, auth, existing, "请填写显示名称。", ToDict(form));
             return;
         }
 
+        if (!TryParseServerPort(form["server_port"], out var serverPort))
+        {
+            await GetInstanceFormAsync(context, auth, existing, "端口须为 1–65535 的整数。", ToDict(form));
+            return;
+        }
+        string? iconUrl;
+        try { iconUrl = await InstanceIcons.ResolveAsync(form, wwwrootDir, store.PublicBaseUrl, context.RequestAborted); }
+        catch (InvalidDataException ex)
+        {
+            context.Response.StatusCode = StatusCodes.Status422UnprocessableEntity;
+            await GetInstanceFormAsync(context, auth, existing, ex.Message, ToDict(form));
+            return;
+        }
         var updated = new Instance
         {
             Id = existing.Id,
             Name = name,
             Description = NullIfEmpty(form["description"]),
-            IconUrl = NullIfEmpty(form["icon_url"]),
-            Sort = ParseNullableInt(form["sort"]),
+            IconUrl = iconUrl,
             Revision = existing.Revision, // preserved by UpdateMetadata too
             Required = IsChecked(form["required"]),
             Minecraft = new MinecraftInfo
@@ -471,7 +541,7 @@ public static class AdminRouter
             Server = new ServerInfo
             {
                 Address = form["server_address"].ToString().Trim(),
-                Port = ParseInt(form["server_port"], 25565),
+                Port = serverPort,
             },
         };
 
@@ -479,9 +549,51 @@ public static class AdminRouter
         Redirect(context, "/admin");
     }
 
+    private static async Task<IFormCollection?> ReadMetadataFormAsync(HttpContext context)
+    {
+        var limit = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (limit is { IsReadOnly: false }) limit.MaxRequestBodySize = InstanceIcons.MaxBytes + 65536;
+        try
+        {
+            return await context.Request.ReadFormAsync(new FormOptions
+            {
+                MultipartBodyLengthLimit = InstanceIcons.MaxBytes, ValueLengthLimit = 16384,
+                ValueCountLimit = 32, MultipartHeadersCountLimit = 16
+            }, context.RequestAborted);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or BadHttpRequestException)
+        {
+            await WriteHtmlAsync(context, Layout("无法保存", "<p class=\"err\">表单或图标文件过大，图标最大支持 2 MiB。</p><a href=\"/admin\">返回概览</a>"), 413);
+            return null;
+        }
+    }
+
+    private static async Task PostReorderAsync(HttpContext context, AuthService auth, InstanceStore store)
+    {
+        context.Response.Headers.CacheControl = "no-store";
+        if (!auth.ValidateCsrf(context, context.Request.Headers["X-CSRF-Token"]))
+        { context.Response.StatusCode = 403; return; }
+        var limit = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (limit is { IsReadOnly: false }) limit.MaxRequestBodySize = 65536;
+        try
+        {
+            var request = await context.Request.ReadFromJsonAsync<ReorderRequest>(context.RequestAborted);
+            if (request?.Ids is null || request.Expected is null) throw new ArgumentException("排序列表无效。");
+            store.Reorder(request.Ids, request.Expected);
+            await context.Response.WriteAsJsonAsync(new { saved = true });
+        }
+        catch (Exception ex) when (ex is ArgumentException or JsonException or InvalidOperationException or BadHttpRequestException)
+        {
+            context.Response.StatusCode = ex is InvalidOperationException ? 409 : 400;
+            await context.Response.WriteAsJsonAsync(new { error = ex is InvalidOperationException ? "整合包列表已变化，请刷新后重新排序。" : "排序列表无效。" });
+        }
+    }
+
+    private sealed record ReorderRequest(string[] Ids, string[] Expected);
+
     // ------------------------------------------------------------- Upload
 
-    private static async Task GetUploadFormAsync(HttpContext context, AuthService auth, InstanceStore store, string id)
+    private static async Task GetUploadFormAsync(HttpContext context, AuthService auth, InstanceStore store, string id, int chunkSize, long uploadLimitBytes)
     {
         var instance = store.Get(id);
         if (instance is null)
@@ -495,31 +607,29 @@ public static class AdminRouter
         var nextRevision = instance.Revision + 1;
 
         var content = $$"""
-<p>Upload a Modrinth <code>.mrpack</code> for <strong>{{H(id)}}</strong>.
-The ZIP must contain a <code>modrinth.index.json</code> entry.
-Revision will become <strong>{{nextRevision}}</strong>.</p>
-<form id="upload-form" data-upload-form method="post" enctype="multipart/form-data" action="/admin/instances/{{idEnc}}/upload">
+<div class="upload-layout"><section class="panel">
+ <div class="panel-title"><div><h2>{{H(instance.Name)}}</h2><div class="upload-meta"><span>{{H(id)}}</span><span class="tag" id="current-revision">当前版本 {{instance.Revision}}</span><span>下一版本 <strong id="next-revision">{{nextRevision}}</strong></span></div></div></div>
+ <form novalidate id="upload-form" data-upload-form data-instance="{{H(id)}}" data-revision="{{instance.Revision}}" data-chunk-size="{{chunkSize}}" data-max-bytes="{{uploadLimitBytes}}" method="post" enctype="multipart/form-data" action="/admin/instances/{{idEnc}}/upload">
   <input type="hidden" name="_csrf" value="{{H(csrf)}}">
-  <label>.mrpack file <input type="file" name="file" id="upload-file" accept=".mrpack,application/zip" required></label>
+  <label class="file-picker upload-dropzone" id="upload-dropzone" for="upload-file" tabindex="0" aria-label="拖拽整合包到此处，或点击选择文件"><svg class="upload-drop-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V3m-6 6 6-6 6 6M3 16v4a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-4"/></svg><span class="file-label">将文件拖入此处，或点击选择文件</span><span class="hint">支持mrpack，最大 {{FormatSize(uploadLimitBytes)}}。</span><span id="selected-file-name">未选择文件</span><input type="file" name="file" id="upload-file" accept=".mrpack" aria-label="选择整合包文件" required><span id="file-summary" class="file-summary" hidden></span></label>
+  <ol class="steps" aria-label="发布流程"><li id="step-hash">校验文件</li><li id="step-upload">上传文件</li><li id="step-publish">校验与发布</li><li id="step-done">发布完成</li></ol>
   <div id="upload-progress-panel" hidden>
-    <progress id="upload-progress" max="100" value="0"></progress>
-    <div class="upload-stats">
-      <span id="upload-percent">0%</span>
-      <span id="upload-bytes">0 MB / 0 MB</span>
-      <span id="upload-speed"></span>
-    </div>
-    <p id="upload-stage" class="upload-stage">正在上传…</p>
+   <div class="progress-heading"><span id="upload-state">准备上传</span><span id="upload-percent">0%</span></div>
+   <progress id="upload-progress" aria-label="当前阶段进度" max="100" value="0"></progress>
+   <div class="upload-stats"><span id="upload-bytes">0 / 0 MiB</span><span id="upload-chunks" hidden></span><span id="upload-speed"></span></div>
+   <p id="upload-stage" class="upload-stage" role="status" aria-live="polite">请选择整合包。</p>
+   <p id="upload-detail" class="upload-detail"></p>
   </div>
-  <p id="upload-error" class="err" hidden></p>
-  <div class="actions">
-    <button type="submit" id="upload-submit">Upload</button>
-    <a href="/admin">Cancel</a>
-  </div>
-</form>
-{{UploadScript}}
+  <p id="upload-error" class="err" role="alert" hidden></p>
+  <p id="upload-login" hidden><a href="/admin/login">重新登录</a>后可回到此页继续任务。</p>
+  <div class="actions"><button type="submit" id="upload-submit">开始上传</button><button type="button" id="upload-pause" class="secondary" disabled>暂停上传</button><button type="button" id="upload-cancel" class="secondary danger" disabled>取消上传</button></div>
+  <p id="upload-cancel-confirm" class="notice" hidden>确定取消上传？<button type="button" id="upload-cancel-yes" class="secondary small danger">确认取消</button> <button type="button" id="upload-cancel-no" class="quiet small">暂不取消</button></p>
+ </form>
+ <div id="upload-result" class="success-box" role="status" hidden><strong id="upload-result-title">发布成功</strong><a href="/admin">返回整合包管理 →</a></div>
+ <noscript><p class="err">上传文件需要启用 JavaScript。</p></noscript>
+</section></div>
 """;
-
-        await WriteHtmlAsync(context, Layout("Upload pack", content));
+        await WriteHtmlAsync(context, Layout("上传与发布", content));
     }
 
     private static async Task PostUploadAsync(
@@ -528,7 +638,7 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
         InstanceStore store,
         string id,
         long uploadLimitBytes,
-        string wwwrootDir)
+        string wwwrootDir, PackPublishService publisher, int chunkSize = 2 * 1024 * 1024)
     {
         var form = await context.Request.ReadFormAsync();
         if (!auth.ValidateCsrf(context, form[AuthService.CsrfFieldName]))
@@ -549,7 +659,7 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
         {
             await WriteHtmlAsync(
                 context,
-                Layout("Upload failed", "<p class=\"err\">No file was uploaded.</p><p><a href=\"/admin\">Back</a></p>"));
+                Layout("上传未完成", "<p class=\"err\">请选择要上传的整合包。</p><p><a href=\"/admin\">返回概览</a></p>"));
             return;
         }
 
@@ -557,348 +667,28 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
         {
             await WriteHtmlAsync(
                 context,
-                Layout("Upload failed", "<p class=\"err\">File exceeds the upload limit.</p><p><a href=\"/admin\">Back</a></p>"),
+                Layout("上传未完成", "<p class=\"err\">文件超出允许上传的大小。</p><p><a href=\"/admin\">返回概览</a></p>"),
                 StatusCodes.Status413PayloadTooLarge);
             return;
         }
 
-        var packDir = Path.Combine(wwwrootDir, "packs", id);
-        Directory.CreateDirectory(packDir);
-        var tmp = Path.Combine(packDir, $".upload-{Guid.NewGuid():N}.tmp");
-
         try
         {
-            // Stream to temp while computing SHA-1 + SHA-256 + SHA-512 + size
-            // in one pass, enforcing the limit.
-            long size = 0;
-            string sha1;
-            string sha256;
-            string sha512;
-            using (var incSha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1))
-            using (var incSha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
-            using (var incSha512 = IncrementalHash.CreateHash(HashAlgorithmName.SHA512))
-            using (var src = file.OpenReadStream())
-            using (var dst = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                var buffer = new byte[81920];
-                int read;
-                while ((read = await src.ReadAsync(buffer)) > 0)
-                {
-                    size += read;
-                    if (size > uploadLimitBytes)
-                        throw new UploadTooLargeException();
-
-                    incSha1.AppendData(buffer, 0, read);
-                    incSha256.AppendData(buffer, 0, read);
-                    incSha512.AppendData(buffer, 0, read);
-                    await dst.WriteAsync(buffer.AsMemory(0, read));
-                }
-
-                sha1 = Convert.ToHexString(incSha1.GetHashAndReset()).ToLowerInvariant();
-                sha256 = Convert.ToHexString(incSha256.GetHashAndReset()).ToLowerInvariant();
-                sha512 = Convert.ToHexString(incSha512.GetHashAndReset()).ToLowerInvariant();
-            }
-
-            // Validate it is a ZIP containing modrinth.index.json.
-            if (!ContainsModrinthIndex(tmp))
-            {
-                File.Delete(tmp);
-                await WriteHtmlAsync(
-                    context,
-                    Layout("Upload failed", "<p class=\"err\">Invalid .mrpack: the ZIP must contain a modrinth.index.json entry.</p><p><a href=\"/admin\">Back</a></p>"));
-                return;
-            }
-
-            // Build the incremental file index from the uploaded pack.
-            var predictedRevision = instance.Revision + 1;
-            byte[] indexBytes;
-            string filesSha256;
-            MinecraftInfo? minecraft = null;
-            try
-            {
-                var build = FileIndexBuilder.Build(tmp, predictedRevision, sha256);
-                indexBytes = FileIndexBuilder.Serialize(build.Index);
-                filesSha256 = FileIndexBuilder.ComputeSha256(indexBytes);
-                minecraft = build.Minecraft;
-
-                // Surface skipped files (unsafe path / no HTTPS URL) so the
-                // operator can see why the index is incomplete. The client falls
-                // back to a full-pack download when a required file is missing.
-                foreach (var skipped in build.SkippedFiles)
-                    Console.Error.WriteLine($"[upload] {id}: skipping {skipped}");
-
-                if (build.Index.Files.Count == 0)
-                {
-                    File.Delete(tmp);
-                    await WriteHtmlAsync(
-                        context,
-                        Layout("Upload failed", "<p class=\"err\">Cannot publish an incremental index: no modrinth index files have both a safe path and an HTTPS download URL. Upload aborted.</p><p><a href=\"/admin\">Back</a></p>"));
-                    return;
-                }
-            }
-            catch (InvalidDataException ex)
-            {
-                File.Delete(tmp);
-                await WriteHtmlAsync(
-                    context,
-                    Layout("Upload failed", $"<p class=\"err\">Invalid .mrpack: {H(ex.Message)}</p><p><a href=\"/admin\">Back</a></p>"));
-                return;
-            }
-
-            // Place the index + pack first, then commit the revision atomically so
-            // the signed manifest never points at a missing artifact. On any
-            // failure below we remove the freshly written files.
-            var indexFile = Path.Combine(packDir, $"{predictedRevision}.files.json");
-            var finalPack = Path.Combine(packDir, $"{predictedRevision}.mrpack");
-            FileIndexBuilder.WriteAtomic(indexFile, indexBytes);
-            File.Move(tmp, finalPack, overwrite: true);
-
-            int revision;
-            try
-            {
-                revision = store.RecordUpload(id, sha1, sha256, sha512, size, filesSha256, predictedRevision, minecraft);
-            }
-            catch (InvalidOperationException ex)
-            {
-                File.Delete(indexFile);
-                File.Delete(finalPack);
-                await WriteHtmlAsync(
-                    context,
-                    Layout("Upload failed", $"<p class=\"err\">{H(ex.Message)}</p><p><a href=\"/admin\">Back</a></p>"));
-                return;
-            }
-
-            if (revision < 0)
-            {
-                File.Delete(indexFile);
-                File.Delete(finalPack);
-                context.Response.StatusCode = StatusCodes.Status404NotFound;
-                return;
-            }
-
+            await using var input = file.OpenReadStream();
+            await publisher.PublishAsync(id, instance.Revision, input, cancellationToken: context.RequestAborted);
             Redirect(context, "/admin");
         }
-        catch (UploadTooLargeException)
+        catch (Exception ex) when (ex is InvalidDataException or InvalidOperationException or IOException)
         {
-            File.Delete(tmp);
-            await WriteHtmlAsync(
-                context,
-                Layout("Upload failed", "<p class=\"err\">File exceeds the upload limit.</p><p><a href=\"/admin\">Back</a></p>"),
-                StatusCodes.Status413PayloadTooLarge);
-        }
-        finally
-        {
-            if (File.Exists(tmp))
-                File.Delete(tmp);
+            var status = ex is PublicationPendingException ? 503
+                : ex is InvalidOperationException ? 409 : 422;
+            await WriteHtmlAsync(context, Layout("上传未完成",
+                "<p class=\"err\">发布未完成，请检查整合包格式、当前版本及服务器存储状态后重试。</p><p><a href=\"/admin\">返回概览</a></p>"), status);
         }
     }
-
-    // Vanilla, dependency-free progress UI for the upload form. Inline so it
-    // needs no external JS/CSS and no CSP exclusions. The plain <form> fallback
-    // still works when JS is disabled.
-    private const string UploadScript =
-        """
-        <script>
-        (function () {
-          "use strict";
-          var form = document.getElementById("upload-form");
-          if (!form) { return; }
-
-          var progressPanel = document.getElementById("upload-progress-panel");
-          var progress = document.getElementById("upload-progress");
-          var percentEl = document.getElementById("upload-percent");
-          var bytesEl = document.getElementById("upload-bytes");
-          var speedEl = document.getElementById("upload-speed");
-          var stageEl = document.getElementById("upload-stage");
-          var errorEl = document.getElementById("upload-error");
-          var submitBtn = document.getElementById("upload-submit");
-          var fileInput = document.getElementById("upload-file");
-
-          var MB = 1024 * 1024;
-          var REDIRECT_DELAY_MS = 800;
-          // Loopback uploads are fast, but server-side hashing of a very large
-          // pack can take a while. This cap only cuts off truly stuck requests.
-          var UPLOAD_TIMEOUT_MS = 30 * 60 * 1000;
-
-          function fmtMB(bytes) {
-            return (bytes / MB).toFixed(2) + " MB";
-          }
-
-          function setProgress(loaded, total) {
-            var percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
-            if (percent > 100) { percent = 100; }
-            progress.value = percent;
-            percentEl.textContent = percent + "%";
-            bytesEl.textContent = fmtMB(loaded) + " / " + fmtMB(total);
-          }
-
-          function setSpeed(bytesPerSec) {
-            speedEl.textContent = bytesPerSec > 0 ? fmtMB(bytesPerSec) + "/s" : "";
-          }
-
-          function setStage(text, done) {
-            stageEl.textContent = text;
-            if (done) {
-              stageEl.classList.add("done");
-            } else {
-              stageEl.classList.remove("done");
-            }
-          }
-
-          function showError(text) {
-            errorEl.textContent = text;
-            errorEl.hidden = false;
-          }
-
-          function setControlsDisabled(disabled) {
-            submitBtn.disabled = disabled;
-            fileInput.disabled = disabled;
-          }
-
-          function fail(text) {
-            setStage("上传失败。", false);
-            showError(text);
-            setControlsDisabled(false);
-          }
-
-          // The server renders error pages (title "Upload failed", <p class="err">)
-          // with HTTP 200. Detect them so we do not falsely report success.
-          function isServerErrorPage(text) {
-            return text.indexOf("class=\"err\"") !== -1 || text.indexOf("Upload failed") !== -1;
-          }
-
-          form.addEventListener("submit", function (ev) {
-            ev.preventDefault();
-
-            if (!fileInput.files || fileInput.files.length === 0) {
-              showError("请选择一个 .mrpack 文件。");
-              return;
-            }
-
-            var file = fileInput.files[0];
-            // Snapshot the fields before disabling controls: disabled inputs are
-            // excluded from FormData, which would drop the file.
-            var formData = new FormData(form);
-
-            errorEl.hidden = true;
-            errorEl.textContent = "";
-            progressPanel.hidden = false;
-            setControlsDisabled(true);
-            setStage("正在上传…", false);
-            setSpeed(0);
-            setProgress(0, file.size);
-
-            var totalBytes = file.size;
-            var lastLoaded = 0;
-            var lastTime = Date.now();
-
-            var xhr = new XMLHttpRequest();
-            xhr.open("POST", form.getAttribute("action"), true);
-            xhr.timeout = UPLOAD_TIMEOUT_MS;
-
-            xhr.upload.onprogress = function (e) {
-              if (!e.lengthComputable) { return; }
-              var now = Date.now();
-              var dt = (now - lastTime) / 1000;
-              if (dt > 0) { setSpeed((e.loaded - lastLoaded) / dt); }
-              lastLoaded = e.loaded;
-              lastTime = now;
-              setProgress(e.loaded, e.total);
-            };
-
-            xhr.upload.onload = function () {
-              setStage("上传完成，服务器正在校验并生成索引…", false);
-              setSpeed(0);
-              setProgress(totalBytes, totalBytes);
-            };
-
-            xhr.onload = function () {
-              var text = xhr.responseText || "";
-              if (xhr.status >= 200 && xhr.status < 300) {
-                if (isServerErrorPage(text)) {
-                  fail("上传失败：服务器拒绝了该文件。");
-                  return;
-                }
-                setStage("上传完成。", true);
-                setProgress(totalBytes, totalBytes);
-                setSpeed(0);
-                setTimeout(function () { window.location.href = "/admin"; }, REDIRECT_DELAY_MS);
-                return;
-              }
-              fail("上传失败：服务器返回 HTTP " + xhr.status + "。");
-            };
-
-            xhr.onerror = function () {
-              fail("上传失败：网络错误，请重试。");
-            };
-
-            xhr.ontimeout = function () {
-              fail("上传失败：请求超时，请重试。");
-            };
-
-            xhr.send(formData);
-          });
-        })();
-        </script>
-        """;
-
-    private static bool ContainsModrinthIndex(string path)
-    {
-        try
-        {
-            using var zip = ZipFile.OpenRead(path);
-            return zip.Entries.Any(e => string.Equals(e.FullName, "modrinth.index.json", StringComparison.OrdinalIgnoreCase));
-        }
-        catch (InvalidDataException)
-        {
-            return false;
-        }
-    }
-
-    // -------------------------------------------------------------- Helpers
-
     private static string Layout(string title, string content)
     {
-        return $$"""
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{H(title)}} — PCL-CMU Admin</title>
-<style>
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto; max-width: 920px; padding: 0 1rem; color: #222; }
-  h1 { font-size: 1.4rem; }
-  table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
-  th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
-  th { background: #f3f3f3; }
-  form { display: grid; gap: 0.5rem; max-width: 620px; }
-  label { display: grid; gap: 0.2rem; font-size: 0.9rem; }
-  input, textarea { padding: 0.35rem; font-size: 0.9rem; font-family: inherit; }
-  fieldset { display: grid; gap: 0.5rem; border: 1px solid #ddd; padding: 0.75rem; }
-  .row { display: flex; gap: 0.75rem; align-items: center; }
-  .row label { display: inline-flex; gap: 0.3rem; align-items: center; }
-  a { color: #1a5fb4; }
-  .err { color: #b00; font-weight: 600; }
-  .actions { margin-top: 0.5rem; display: flex; gap: 0.75rem; align-items: center; }
-  code { background: #f3f3f3; padding: 0 0.2rem; }
-  [hidden] { display: none !important; }
-  #upload-progress-panel { display: grid; gap: 0.4rem; margin-top: 0.5rem; }
-  #upload-progress { width: 100%; max-width: 620px; height: 1rem; border: 0; appearance: none; -webkit-appearance: none; }
-  #upload-progress::-webkit-progress-bar { background: #eee; border-radius: 999px; }
-  #upload-progress::-webkit-progress-value { background: #1a5fb4; border-radius: 999px; }
-  #upload-progress::-moz-progress-bar { background: #1a5fb4; border-radius: 999px; }
-  .upload-stats { display: flex; flex-wrap: wrap; gap: 0.75rem; font-size: 0.85rem; color: #444; }
-  .upload-stage { margin: 0; font-size: 0.9rem; color: #333; }
-  .upload-stage.done { color: #177245; font-weight: 600; }
-</style>
-</head>
-<body>
-<h1>{{H(title)}}</h1>
-{{content}}
-</body>
-</html>
-""";
+        return AdminUi.Render(title, content);
     }
 
     private static async Task WriteHtmlAsync(HttpContext context, string html, int statusCode = StatusCodes.Status200OK)
@@ -912,11 +702,14 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
     private static async Task MethodNotAllowedAsync(HttpContext context)
     {
         context.Response.StatusCode = StatusCodes.Status405MethodNotAllowed;
-        await context.Response.WriteAsync("Method not allowed.");
+        await context.Response.WriteAsync("不支持此请求方式。");
     }
 
     private static void Redirect(HttpContext context, string location)
         => context.Response.Redirect(location, permanent: false);
+
+    private static string FormatSize(long size) => size >= 1073741824 ? $"{size / 1073741824d:0.##} GiB"
+        : size >= 1048576 ? $"{size / 1048576d:0.##} MiB" : $"{size / 1024d:0.##} KiB";
 
     private static string H(string? s) => WebUtility.HtmlEncode(s ?? "");
 
@@ -935,8 +728,14 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
         return int.TryParse(s, out var n) ? n : null;
     }
 
-    private static int ParseInt(StringValues v, int fallback)
-        => int.TryParse(v.ToString().Trim(), out var n) ? n : fallback;
+    private static bool TryParseServerPort(StringValues value, out int port)
+    {
+        port = 25565;
+        if (value.Count > 1) return false;
+        var text = value.ToString().Trim();
+        return text.Length == 0 || (int.TryParse(text, System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out port) && port is >= 1 and <= 65535);
+    }
 
     private static bool IsChecked(StringValues v)
         => string.Equals(v.ToString(), "true", StringComparison.Ordinal);
@@ -949,5 +748,5 @@ Revision will become <strong>{{nextRevision}}</strong>.</p>
         return d;
     }
 
-    private sealed class UploadTooLargeException : Exception;
+
 }

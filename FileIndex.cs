@@ -87,11 +87,12 @@ public static class FileIndexBuilder
     /// <see cref="InvalidDataException"/> if the archive is missing or has a
     /// corrupt <c>modrinth.index.json</c>.
     /// </summary>
-    public static FileIndexBuildResult Build(string zipPath, int revision, string packSha256)
+    public static FileIndexBuildResult Build(string zipPath, int revision, string packSha256, CancellationToken cancellationToken = default)
     {
         using var zip = ZipFile.OpenRead(zipPath);
+        ValidateArchive(zip);
 
-        var overridesSha256 = ComputeOverridesSha256(zip);
+        var overridesSha256 = ComputeOverridesSha256(zip, cancellationToken);
         var (files, skipped, minecraft) = BuildFiles(zip);
 
         var index = new FileIndex
@@ -122,6 +123,8 @@ public static class FileIndexBuilder
             var entry = zip.Entries.FirstOrDefault(e =>
                 string.Equals(e.FullName, IndexEntryName, StringComparison.OrdinalIgnoreCase));
             if (entry is null)
+                return false;
+            if (entry.Length > 16 * 1024 * 1024)
                 return false;
 
             using var stream = entry.Open();
@@ -191,6 +194,8 @@ public static class FileIndexBuilder
 
         if (indexEntry is null)
             throw new InvalidDataException("The ZIP must contain a modrinth.index.json entry.");
+        if (indexEntry.Length > 16 * 1024 * 1024)
+            throw new InvalidDataException("modrinth.index.json exceeds 16 MiB.");
 
         ModrinthIndexDto dto;
         try
@@ -209,6 +214,7 @@ public static class FileIndexBuilder
 
         foreach (var f in dto.Files ?? [])
         {
+            if (f is null) throw new InvalidDataException("modrinth.index.json contains a null file entry.");
             var path = f.Path ?? "";
 
             if (!IsSafeRelativePath(path))
@@ -348,7 +354,22 @@ public static class FileIndexBuilder
     ///      each entry in sorted order.
     ///   4. Return the lowercase hex digest.
     /// </summary>
-    private static string ComputeOverridesSha256(ZipArchive zip)
+    private static void ValidateArchive(ZipArchive zip)
+    {
+        if (zip.Entries.Count > 100000) throw new InvalidDataException("Archive has too many entries.");
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        long expanded = 0;
+        foreach (var entry in zip.Entries)
+        {
+            expanded = checked(expanded + entry.Length);
+            if (expanded > 8L * 1024 * 1024 * 1024)
+                throw new InvalidDataException("Archive expanded size exceeds 8 GiB.");
+            if (!IsSafeRelativePath(entry.FullName.TrimEnd('/')) || !names.Add(entry.FullName))
+                throw new InvalidDataException("Unsafe or duplicate archive entry.");
+        }
+    }
+
+    private static string ComputeOverridesSha256(ZipArchive zip, CancellationToken cancellationToken)
     {
         var entries = zip.Entries
             .Where(e => !e.FullName.EndsWith('/'))
@@ -358,6 +379,8 @@ public static class FileIndexBuilder
             .ToList();
 
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[81920];
+        long expanded = 0;
 
         foreach (var entry in entries)
         {
@@ -365,10 +388,14 @@ public static class FileIndexBuilder
             hash.AppendData(NulByte);
 
             using var stream = entry.Open();
-            var buffer = new byte[81920];
             int read;
             while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                expanded += read;
+                if (expanded > 8L * 1024 * 1024 * 1024) throw new InvalidDataException("Expanded overrides exceed 8 GiB.");
                 hash.AppendData(buffer, 0, read);
+            }
         }
 
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();

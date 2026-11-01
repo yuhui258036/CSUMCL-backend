@@ -34,13 +34,24 @@ var tempRoot = Path.Combine(Path.GetTempPath(), $"pclcmu-tests-{Guid.NewGuid():N
 Directory.CreateDirectory(tempRoot);
 try
 {
-    TestPathSafety();
-    TestFileIndexBuild();
-    TestOverridesGroundTruth();
-    TestInstanceStoreManifest();
-    TestDependencyMapping();
-    TestUploadMetadata();
-    TestStartupBackfill();
+    if (!args.Contains("--http-only", StringComparer.Ordinal))
+    {
+        TestPathSafety();
+        TestFileIndexBuild();
+        TestOverridesGroundTruth();
+        TestInstanceStoreManifest();
+        TestDependencyMapping();
+        TestUploadMetadata();
+        TestStartupBackfill();
+        await TestPublicationTransactions();
+        await TestChunkUploads();
+        await TestMalformedUpload();
+        await UploadGuardTests.Run(tempRoot, Check);
+    }
+    await HttpUploadTests.Run(tempRoot, Check, args.Contains("--browser", StringComparer.Ordinal));
+    if (Environment.GetEnvironmentVariable("CSUMCL_TEST_SECOND_VOLUME") is { Length: > 0 } secondVolume)
+        await CrossVolumeTests.Run(tempRoot, secondVolume, Check);
+    if (args.Contains("--performance", StringComparer.Ordinal)) await UploadPerformance.Run(tempRoot, Check);
 
     Console.WriteLine($"\n{checks - failures}/{checks} checks passed, {failures} failed.");
 }
@@ -50,6 +61,290 @@ finally
 }
 
 return failures == 0 ? 0 : 1;
+
+async Task TestMalformedUpload()
+{
+    Section("malformed pack isolation");
+    var root = Path.Combine(tempRoot, "malformed");
+    Directory.CreateDirectory(root);
+    var keyPath = Path.Combine(root, "key.pem");
+    using (var key = ECDsa.Create(ECCurve.NamedCurves.nistP256)) File.WriteAllText(keyPath, key.ExportPkcs8PrivateKeyPem());
+    var data = Path.Combine(root, "data");
+    var web = Path.Combine(root, "web");
+    var store = new InstanceStore(data, web, "https://cdn.example.com", keyPath);
+    store.Create(new Instance { Id = "test", Name = "test" });
+    using var uploads = new ChunkUploadService(data, web, store, new PackPublishService(store, 1048576),
+        new ChunkUploadOptions { MaxFileBytes = 1048576, QuotaBytes = 4194304, MinFreeBytes = 0 });
+    await uploads.StartAsync(default);
+    try
+    {
+        foreach (var malformed in new[] { true, false })
+        {
+            var inputDir = Path.Combine(root, malformed ? "bad" : "good");
+            Directory.CreateDirectory(inputDir);
+            var pack = WriteSyntheticPack(inputDir, malformed ? "{\"files\":[null]}" : PackIndexWithDeps("{}"), []);
+            var bytes = File.ReadAllBytes(pack);
+            var status = await uploads.CreateAsync(new CreateUpload("test", "pack.mrpack", bytes.Length, Sha256Hex(bytes), 0), default);
+            var grant = await uploads.RenewAsync(status.Id, default);
+            using var input = new MemoryStream(bytes);
+            await uploads.PutChunkAsync(status.Id, 0, grant.Token, Sha256Hex(bytes), bytes.Length, input, default);
+            await uploads.CompleteAsync(status.Id, default);
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            do { await Task.Delay(10); status = await uploads.GetAsync(status.Id, default); }
+            while (status.State is "queued" or "verifying" && DateTime.UtcNow < deadline);
+            Check(status.State == (malformed ? "failed" : "completed"), malformed
+                ? "null file entry fails only its own upload" : "same worker publishes valid upload after malformed pack");
+            Check(uploads.ExecuteTask is { IsCompleted: false }, "upload worker stays alive after validation result");
+        }
+    }
+    finally { await uploads.StopAsync(default); }
+}
+
+async Task TestChunkUploads()
+{
+    Section("durable chunk uploads");
+    var root = Path.Combine(tempRoot, "chunks");
+    Directory.CreateDirectory(root);
+    var key = Path.Combine(root, "key.pem");
+    using (var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256)) File.WriteAllText(key, ecdsa.ExportPkcs8PrivateKeyPem());
+    var data = Path.Combine(root, "data");
+    var web = Path.Combine(root, "web");
+    var store = new InstanceStore(data, web, "https://cdn.example.com", key);
+    store.Create(new Instance { Id = "test", Name = "Test" });
+    var publisher = new PackPublishService(store, 1024 * 1024);
+    var options = new ChunkUploadOptions { ChunkSizeBytes = 65536, MaxFileBytes = 1024 * 1024, MinFreeBytes = 0, QuotaBytes = 4 * 1024 * 1024 };
+    var path = WriteSyntheticPack(root, PackIndexWithDeps("""{"minecraft":"1.21.1"}"""), [("overrides/test.bin", RandomNumberGenerator.GetBytes(180000))]);
+    var bytes = File.ReadAllBytes(path);
+    var request = new CreateUpload("test", "sample.mrpack", bytes.Length, Sha256Hex(bytes), 0);
+    using var first = new ChunkUploadService(data, web, store, publisher, options);
+    var created = await first.CreateAsync(request, default);
+    Check(created.ChunkCount == 3, "pack spans three chunks");
+    Check((await first.CreateAsync(request, default)).Id == created.Id, "create is idempotent after response loss");
+    var grant = await first.RenewAsync(created.Id, default);
+    var metadata = File.ReadAllText(Path.Combine(data, "uploads", created.Id, "session.json"));
+    Check(!metadata.Contains(grant.Token, StringComparison.Ordinal), "raw upload token is never persisted");
+    byte[] Chunk(int index) => bytes.Skip(index * options.ChunkSizeBytes).Take(options.ChunkSizeBytes).ToArray();
+    async Task Send(ChunkUploadService service, int index, string token, string? hash = null, byte[]? payload = null)
+    {
+        var chunk = payload ?? Chunk(index);
+        await using var stream = new MemoryStream(chunk);
+        await service.PutChunkAsync(created.Id, index, token, hash ?? Sha256Hex(chunk), chunk.Length, stream, default);
+    }
+    async Task Reject(Func<Task> operation, int status, string description)
+    {
+        var actual = 0;
+        try { await operation(); } catch (UploadApiException ex) { actual = ex.Status; }
+        Check(actual == status, description + $" (HTTP {actual})");
+    }
+    await Reject(() => Send(first, 2, new string('0', 64)), 401, "bad grant rejected before chunk is stored");
+    await Reject(() => Send(first, 2, grant.Token, new string('0', 64)), 422, "chunk hash mismatch rejected");
+    await Send(first, 2, grant.Token);
+    await Send(first, 2, grant.Token);
+    Check((await first.GetAsync(created.Id, default)).Received.SequenceEqual([2]), "out-of-order duplicate creates exactly one receipt");
+    await Reject(() => Send(first, 2, grant.Token, new string('f', 64)), 409, "conflicting duplicate rejected");
+    await Reject(async () => { await first.CompleteAsync(created.Id, default); }, 409, "cannot complete with missing chunks");
+    await Reject(() => Send(first, 0, grant.Token, payload: new byte[1]), 400, "wrong chunk size rejected");
+    var renewed = await first.RenewAsync(created.Id, default);
+    await Reject(() => Send(first, 0, grant.Token), 401, "renewal invalidates old grant");
+
+    using var resumed = new ChunkUploadService(data, web, store, publisher, options);
+    Check((await resumed.GetAsync(created.Id, default)).Received.SequenceEqual([2]), "restart preserves chunk receipt");
+    await Task.WhenAll(Send(resumed, 0, renewed.Token), Send(resumed, 1, renewed.Token));
+    Check((await resumed.GetAsync(created.Id, default)).Received.Length == 3, "parallel chunks retained after restart");
+    var queued = await resumed.CompleteAsync(created.Id, default);
+    Check(queued.State == "queued", "completion persists job before worker starts");
+    Check((await resumed.CompleteAsync(created.Id, default)).State == "queued", "duplicate complete does not create a new job");
+
+    using var worker = new ChunkUploadService(data, web, store, publisher, options);
+    await worker.StartAsync(default);
+    var deadline = DateTime.UtcNow.AddSeconds(10);
+    UploadStatus status;
+    do
+    {
+        await Task.Delay(25);
+        status = await worker.GetAsync(created.Id, default);
+    } while (status.State is "queued" or "verifying" && DateTime.UtcNow < deadline);
+    Check(status.State == "completed" && status.Revision == 1, "queued job resumes after second restart and publishes");
+    Check(File.ReadAllBytes(Path.Combine(web, "packs", "test", "1.mrpack")).SequenceEqual(bytes), "published bytes match reassembled original");
+    Check((await worker.CompleteAsync(created.Id, default)).Revision == 1, "completed retry returns same revision");
+    Check(!Directory.EnumerateFiles(Path.Combine(data, "uploads", created.Id), "*.chunk").Any(), "completed job releases chunk storage");
+    await worker.StopAsync(default);
+
+    using var last = new ChunkUploadService(data, web, store, publisher, options);
+    Check((await last.GetAsync(created.Id, default)).State == "completed", "completion receipt survives restart");
+    var cancelled = await last.CreateAsync(request with { BaseRevision = 1, Sha256 = new string('a', 64) }, default);
+    await last.CancelAsync(cancelled.Id, default);
+    await Reject(async () => { await last.GetAsync(cancelled.Id, default); }, 410, "cancelled task cannot be resumed");
+    var invalid = request with { BaseRevision = 1, Size = options.MaxFileBytes + 1 };
+    await Reject(async () => { await last.CreateAsync(invalid, default); }, 400, "file size cap enforced before allocation");
+
+    // A failed full-file check must still reserve the retained chunks' quota.
+    options.QuotaBytes = 2 * 1024 * 1024;
+    using var failing = new ChunkUploadService(data, web, store, publisher, options);
+    var failed = await failing.CreateAsync(request with { BaseRevision = 1, Sha256 = new string('b', 64) }, default);
+    var failedGrant = await failing.RenewAsync(failed.Id, default);
+    for (var i = 0; i < failed.ChunkCount; i++)
+    {
+        var chunk = Chunk(i);
+        using var stream = new MemoryStream(chunk);
+        await failing.PutChunkAsync(failed.Id, i, failedGrant.Token, Sha256Hex(chunk), chunk.Length, stream, default);
+    }
+    await failing.CompleteAsync(failed.Id, default);
+    await failing.StartAsync(default);
+    deadline = DateTime.UtcNow.AddSeconds(10);
+    do { await Task.Delay(25); status = await failing.GetAsync(failed.Id, default); }
+    while (status.State is "queued" or "verifying" && DateTime.UtcNow < deadline);
+    Check(status.State == "failed" && store.Get("test")?.Revision == 1, "whole-file mismatch fails without publishing");
+    await Reject(async () => { await failing.CreateAsync(request with { BaseRevision = 1, Size = 1024 * 1024, Sha256 = new string('c',64) }, default); },
+        507, "failed uploads still reserve disk quota");
+    await failing.CancelAsync(failed.Id, default);
+    Check(!Directory.EnumerateFiles(Path.Combine(data, "uploads", failed.Id), "*.chunk").Any(), "cancelling failed upload releases disk bytes");
+    await failing.StopAsync(default);
+
+    foreach (var faultState in new[] { "verifying", "completed" })
+    {
+        var id = "storage-" + faultState;
+        store.Create(new Instance { Id = id, Name = id });
+        using var recoverable = new ChunkUploadService(data, web, store, publisher, options);
+        var upload = await recoverable.CreateAsync(request with { InstanceId = id }, default);
+        var permission = await recoverable.RenewAsync(upload.Id, default);
+        for (var i = 0; i < upload.ChunkCount; i++)
+        {
+            var chunk = Chunk(i);
+            using var stream = new MemoryStream(chunk);
+            await recoverable.PutChunkAsync(upload.Id, i, permission.Token, Sha256Hex(chunk), chunk.Length, stream, default);
+        }
+        await recoverable.CompleteAsync(upload.Id, default);
+        var injected = false;
+        recoverable.SaveCheckpoint = state =>
+        {
+            if (state == faultState && !injected) { injected = true; throw new IOException("Injected session disk failure"); }
+        };
+        await recoverable.StartAsync(default);
+        deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!recoverable.StorageUnavailable && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Check(injected && recoverable.StorageUnavailable && recoverable.ExecuteTask is { IsCompleted: false },
+            $"{faultState} write failure retains live worker instead of stopping host");
+        deadline = DateTime.UtcNow.AddSeconds(10);
+        do { await Task.Delay(25); status = await recoverable.GetAsync(upload.Id, default); }
+        while (status.State != "completed" && DateTime.UtcNow < deadline);
+        Check(status.State == "completed" && store.Get(id)?.Revision == 1, $"{faultState} failure automatically recovers without duplicate publication");
+        Check(!recoverable.StorageUnavailable, $"{faultState} recovery clears upload storage hold");
+        Check(!Directory.EnumerateFiles(Path.Combine(data, "uploads", upload.Id), "*.chunk").Any(), $"{faultState} recovery reclaims chunks");
+        await recoverable.StopAsync(default);
+    }
+}
+
+async Task TestPublicationTransactions()
+{
+    Section("publication concurrency and crash recovery");
+    var key = Path.Combine(tempRoot, "transaction-key.pem");
+    using (var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256))
+        File.WriteAllText(key, ecdsa.ExportPkcs8PrivateKeyPem());
+
+    foreach (var checkpoint in new[] { "before-journal", "after-journal", "after-transfer", "after-pack", "after-index", "after-instances", "after-signature", "after-manifest" })
+    {
+        var root = Path.Combine(tempRoot, checkpoint);
+        Directory.CreateDirectory(root);
+        var data = Path.Combine(root, "data");
+        var web = Path.Combine(root, "web");
+        var store = new InstanceStore(data, web, "https://cdn.example.com", key);
+        store.Create(new Instance { Id = "test", Name = "Test" });
+        var pack = WriteSyntheticPack(root, PackIndexWithDeps("""{"minecraft":"1.21.1"}"""), []);
+        var originalBytes = File.ReadAllBytes(pack);
+        var oldManifest = File.ReadAllBytes(Path.Combine(web, "manifest.json"));
+        store.Checkpoint = step => { if (step == checkpoint) throw new IOException("Injected disk interruption"); };
+        Exception? failure = null;
+        try
+        {
+            await using var input = File.OpenRead(pack);
+            await new PackPublishService(store, 1024 * 1024).PublishAsync("test", 0, input);
+        }
+        catch (IOException ex) { failure = ex; }
+        Check(failure is not null, $"{checkpoint}: failure injected");
+        if (checkpoint == "before-journal")
+        {
+            Check(store.Get("test")?.Revision == 0 && !store.RecoveryRequired, "pre-commit failure rolls back memory");
+            Check(oldManifest.SequenceEqual(File.ReadAllBytes(Path.Combine(web, "manifest.json"))), "pre-commit failure preserves published manifest");
+            Check(!Directory.EnumerateFiles(store.StagingDirectory).Any(), "pre-commit failure cleans only its staging file");
+        }
+        else
+        {
+            Check(failure is PublicationPendingException && store.RecoveryRequired, $"{checkpoint}: durable commit blocks further writes");
+            var recovered = new InstanceStore(data, web, "https://cdn.example.com", key);
+            Check(recovered.Get("test")?.Revision == 1, $"{checkpoint}: restart recovers revision");
+            var published = Path.Combine(web, "packs", "test", "1.mrpack");
+            Check(File.ReadAllBytes(published).SequenceEqual(originalBytes), $"{checkpoint}: published bytes survive");
+            var index = File.ReadAllBytes(Path.Combine(web, "packs", "test", "1.files.json"));
+            Check(recovered.Get("test")?.Pack?.FilesSha256 == Sha256Hex(index), $"{checkpoint}: index hash matches manifest");
+            Check(!File.Exists(Path.Combine(data, "publication.pending.json")), $"{checkpoint}: recovery journal completed");
+        }
+    }
+
+    var concurrentRoot = Path.Combine(tempRoot, "concurrent");
+    Directory.CreateDirectory(concurrentRoot);
+    var concurrentStore = new InstanceStore(Path.Combine(concurrentRoot, "data"), Path.Combine(concurrentRoot, "web"), "https://cdn.example.com", key);
+    concurrentStore.Create(new Instance { Id = "test", Name = "Test" });
+    var concurrentPack = WriteSyntheticPack(concurrentRoot, PackIndexWithDeps("""{"minecraft":"1.21.1"}"""), []);
+    async Task<bool> Publish()
+    {
+        try
+        {
+            await using var input = File.OpenRead(concurrentPack);
+            await new PackPublishService(concurrentStore, 1024 * 1024).PublishAsync("test", 0, input);
+            return true;
+        }
+        catch (InvalidOperationException) { return false; }
+    }
+    var outcomes = await Task.WhenAll(Task.Run(Publish), Task.Run(Publish));
+    Check(outcomes.Count(x => x) == 1, "concurrent publishers: exactly one succeeds");
+    var winningPack = Path.Combine(concurrentRoot, "web", "packs", "test", "1.mrpack");
+    Check(File.ReadAllBytes(winningPack).SequenceEqual(File.ReadAllBytes(concurrentPack)), "losing upload cannot overwrite/delete winner");
+    Check(concurrentStore.Get("test")?.Revision == 1, "concurrent publishers increment revision once");
+
+    var badData = Path.Combine(tempRoot, "corrupt-store");
+    Directory.CreateDirectory(badData);
+    File.WriteAllText(Path.Combine(badData, "instances.json"), "{corrupt");
+    var refused = false;
+    try { _ = new InstanceStore(badData, Path.Combine(tempRoot, "corrupt-web"), "https://cdn.example.com", key); }
+    catch (InvalidDataException) { refused = true; }
+    Check(refused && File.ReadAllText(Path.Combine(badData, "instances.json")) == "{corrupt", "corrupt store fails closed without erasing data");
+
+    var cleanupRoot = Path.Combine(tempRoot, "staging-cleanup");
+    var cleanupData = Path.Combine(cleanupRoot, "data");
+    var cleanupWeb = Path.Combine(cleanupRoot, "web");
+    var staging = Path.Combine(cleanupData, "publishing");
+    Directory.CreateDirectory(staging);
+    var orphan = Path.Combine(staging, Guid.NewGuid().ToString("N") + ".mrpack");
+    File.WriteAllBytes(orphan, [1, 2, 3]);
+    File.WriteAllText(Path.Combine(staging, "operator-note.txt"), "preserve");
+    var cleanupStore = new InstanceStore(cleanupData, cleanupWeb, "https://cdn.example.com", key);
+    Check(!File.Exists(orphan), "startup reclaims pre-commit validation remnants");
+    Check(File.ReadAllText(Path.Combine(staging, "operator-note.txt")) == "preserve", "startup cleanup only removes owned GUID pack files");
+    if (OperatingSystem.IsWindows())
+    {
+        cleanupStore.Create(new Instance { Id = "test", Name = "Test" });
+        var cleanupPack = WriteSyntheticPack(cleanupRoot, PackIndexWithDeps("""{"minecraft":"1.21.1"}"""), []);
+        var cleanupPublisher = new PackPublishService(cleanupStore, 1024 * 1024);
+        FileStream? held = null;
+        cleanupStore.Checkpoint = state =>
+        {
+            if (state != "before-journal") return;
+            held = new FileStream(Directory.EnumerateFiles(staging, "*.mrpack").Single(), FileMode.Open, FileAccess.Read, FileShare.Read);
+            throw new IOException("Injected validation/cleanup failure");
+        };
+        try
+        {
+            using var input = File.OpenRead(cleanupPack);
+            try { await cleanupPublisher.PublishAsync("test", 0, input); } catch (IOException) { }
+            Check(Directory.EnumerateFiles(staging, "*.mrpack").Any(), "locked staging file simulates cleanup failure");
+        }
+        finally { held?.Dispose(); cleanupStore.Checkpoint = null; }
+        using var retryInput = File.OpenRead(cleanupPack);
+        var recoveredRevision = await cleanupPublisher.PublishAsync("test", 0, retryInput).WaitAsync(TimeSpan.FromSeconds(5));
+        Check(recoveredRevision == 1, "cleanup failure does not strand the publisher semaphore");
+    }
+}
 
 // ------------------------------------------------------------- path safety
 

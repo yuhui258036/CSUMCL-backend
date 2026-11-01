@@ -20,6 +20,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="upload.js;upload-background.js;admin-navigation.js;admin-validation.js;sha256-worker.js;admin.css;admin.js;admin-logo.png" />
     <Content Remove="certs\**;**\*.pem;**\*.key;**\*.pfx;**\*.p12;**\admin.env;**\.env;**\.env.*;**\*credentials*;appsettings.example.json" />
     <None Remove="certs\**;**\*.pem;**\*.key;**\*.pfx;**\*.p12;**\admin.env;**\.env;**\.env.*;**\*credentials*;appsettings.example.json" />
     <Content Remove="data\**" />

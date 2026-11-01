@@ -9,6 +9,11 @@ WorkingDirectory=/opt/pcl-cmu/app
 ExecStart=/opt/dotnet/dotnet /opt/pcl-cmu/app/PclCmu.Admin.dll
 Restart=always
 RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+RuntimeDirectory=pcl-cmu
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/pcl-cmu
 EnvironmentFile=/opt/pcl-cmu/admin.env
 
 # To bind the privileged port 443 without running the whole process as root,

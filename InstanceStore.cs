@@ -23,6 +23,24 @@ public sealed class InstanceStore
     private readonly ManifestSigner _signer;
     private readonly object _gate = new();
     private List<Instance> _instances;
+    private List<Instance> _committed = [];
+    public bool RecoveryRequired { get; private set; }
+    internal Action<string>? Checkpoint { get; set; }
+    internal string StagingDirectory => Path.Combine(_dataDir, "publishing");
+    internal string PublicBaseUrl => _publicBaseUrl;
+
+    private sealed class Publication
+    {
+        public byte[] Instances { get; set; } = [];
+        public byte[] Manifest { get; set; } = [];
+        public byte[] Signature { get; set; } = [];
+        public string? StagedPack { get; set; }
+        public string? InstanceId { get; set; }
+        public int Revision { get; set; }
+        public byte[]? Index { get; set; }
+    }
+
+    private string JournalPath => Path.Combine(_dataDir, "publication.pending.json");
 
     /// <summary>
     /// Creates the store and regenerates the signed manifest. Throws a clear
@@ -35,7 +53,15 @@ public sealed class InstanceStore
         _publicBaseUrl = publicBaseUrl.TrimEnd('/');
         _signer = new ManifestSigner(manifestSigningKeyPath);
 
+        if (File.Exists(JournalPath))
+        {
+            var pending = JsonSerializer.Deserialize<Publication>(File.ReadAllBytes(JournalPath))
+                ?? throw new InvalidDataException("Invalid publication journal; refusing to discard it.");
+            ApplyPublication(pending);
+        }
+
         _instances = LoadInstances(Path.Combine(_dataDir, "instances.json"));
+        _committed = _instances.Select(Clone).ToList();
 
         // Correct stale Minecraft metadata from each published pack's dependency
         // section. Only rewrites instances.json when something actually changed;
@@ -51,6 +77,13 @@ public sealed class InstanceStore
             else
                 RegenerateManifestLocked();
         }
+        // The process-wide writer lease is held before construction. Journal
+        // recovery above owns any committed staging file; remaining GUID packs
+        // are pre-commit remnants from interrupted validation and can be reclaimed.
+        if (Directory.Exists(StagingDirectory))
+            foreach (var path in Directory.EnumerateFiles(StagingDirectory, "*.mrpack"))
+                if (Guid.TryParseExact(Path.GetFileNameWithoutExtension(path), "N", out _))
+                    DurableFile.TryDelete(path);
     }
 
     /// <summary>Ordered snapshot of all instances (sort ascending, then id).</summary>
@@ -80,11 +113,22 @@ public sealed class InstanceStore
         lock (_gate) return Find(id) is not null;
     }
 
-    public void Create(Instance instance)
+    public void Create(Instance instance, bool append = false)
     {
         lock (_gate)
         {
-            _instances.Add(instance);
+            EnsureWritable();
+            if (Find(instance.Id) is not null)
+                throw new InvalidOperationException("Instance already exists.");
+            if (!System.Text.RegularExpressions.Regex.IsMatch(instance.Id, "^[a-z0-9_-]{1,64}$"))
+                throw new ArgumentException("Invalid instance id.");
+            if (append)
+            {
+                var ordered = List();
+                for (var n = 0; n < ordered.Count; n++) Find(ordered[n].Id)!.Sort = n;
+                instance.Sort = ordered.Count;
+            }
+            _instances.Add(Clone(instance));
             SaveLocked();
         }
     }
@@ -94,6 +138,7 @@ public sealed class InstanceStore
     {
         lock (_gate)
         {
+            EnsureWritable();
             var index = IndexOf(instance.Id);
             if (index < 0)
                 return false;
@@ -101,9 +146,26 @@ public sealed class InstanceStore
             var existing = _instances[index];
             instance.Revision = existing.Revision;
             instance.Pack = existing.Pack;
-            _instances[index] = instance;
+            instance.Sort = existing.Sort; // Editing metadata cannot undo a concurrent reorder.
+            _instances[index] = Clone(instance);
             SaveLocked();
             return true;
+        }
+    }
+
+    public void Reorder(string[] ids, string[] expected)
+    {
+        lock (_gate)
+        {
+            EnsureWritable();
+            var current = List().Select(i => i.Id).ToArray();
+            if (!current.SequenceEqual(expected, StringComparer.Ordinal))
+                throw new InvalidOperationException("整合包列表已变化，请刷新后重新排序。");
+            if (ids.Length != current.Length || ids.Distinct(StringComparer.Ordinal).Count() != ids.Length
+                || !ids.ToHashSet(StringComparer.Ordinal).SetEquals(current))
+                throw new ArgumentException("排序列表无效，请刷新后重试。");
+            for (var n = 0; n < ids.Length; n++) Find(ids[n])!.Sort = n;
+            SaveLocked();
         }
     }
 
@@ -129,6 +191,7 @@ public sealed class InstanceStore
     {
         lock (_gate)
         {
+            EnsureWritable();
             var index = IndexOf(id);
             if (index < 0)
                 return -1;
@@ -224,6 +287,56 @@ public sealed class InstanceStore
 
     private void SaveLocked()
     {
+        CommitLocked(null);
+    }
+
+    private void EnsureWritable()
+    {
+        if (RecoveryRequired)
+            throw new PublicationPendingException("A durable publication needs recovery. Restart after resolving the disk error.");
+    }
+
+    // Called only after hashing/ZIP validation. The revision check, artifact
+    // ownership and durable commit share the same lock as metadata changes.
+    internal int PublishPack(string id, int baseRevision, string stagedPack,
+        string sha1, string sha256, string sha512, long size, byte[] indexBytes,
+        MinecraftInfo? minecraft)
+    {
+        lock (_gate)
+        {
+            EnsureWritable();
+            var instance = Find(id) ?? throw new KeyNotFoundException("Instance not found.");
+            if (instance.Revision != baseRevision)
+                throw new InvalidOperationException("The instance changed since this upload started. Refresh before publishing.");
+            var revision = checked(baseRevision + 1);
+            var packDir = Path.Combine(_wwwrootDir, "packs", id);
+            if (File.Exists(Path.Combine(packDir, $"{revision}.mrpack")) ||
+                File.Exists(Path.Combine(packDir, $"{revision}.files.json")))
+                throw new IOException("Revision artifacts already exist; refusing to overwrite them.");
+
+            instance.Revision = revision;
+            instance.Pack = new PackInfo
+            {
+                Url = PackUrl(id, revision), Sha1 = sha1, Sha256 = sha256,
+                Sha512 = sha512, Size = size, FilesUrl = FilesUrl(id, revision),
+                FilesSha256 = FileIndexBuilder.ComputeSha256(indexBytes),
+            };
+            instance.ApplyMinecraft(minecraft);
+            CommitLocked(new Publication
+            {
+                StagedPack = Path.GetFileName(stagedPack), InstanceId = id,
+                Revision = revision, Index = indexBytes,
+            });
+            return revision;
+        }
+    }
+
+    private void CommitLocked(Publication? publication)
+    {
+        EnsureWritable();
+        var committed = false;
+        try
+        {
         // Keep the stored pack.url (and files_url) in sync with PublicBaseUrl so
         // instances.json is always self-consistent.
         foreach (var i in _instances)
@@ -236,10 +349,90 @@ public sealed class InstanceStore
             }
         }
 
-        Directory.CreateDirectory(_dataDir);
-        AtomicWriteBytes(Path.Combine(_dataDir, "instances.json"), SerializeUtf8(_instances));
+            publication ??= new Publication();
+            publication.Instances = SerializeUtf8(_instances);
+            publication.Manifest = SerializeUtf8(BuildManifestLocked());
+            // Sign before changing any published file.
+            publication.Signature = Encoding.UTF8.GetBytes(_signer.Sign(publication.Manifest));
+            Checkpoint?.Invoke("before-journal");
+            DurableFile.Write(JournalPath, JsonSerializer.SerializeToUtf8Bytes(publication));
+            committed = true;
+            _committed = _instances.Select(Clone).ToList();
+            Checkpoint?.Invoke("after-journal");
+            ApplyPublication(publication);
+        }
+        catch (Exception ex)
+        {
+            if (!committed)
+            {
+                _instances = _committed.Select(Clone).ToList();
+                throw;
+            }
+            RecoveryRequired = true;
+            throw new PublicationPendingException("Publication is durable but needs disk recovery; its resources have been retained.", ex);
+        }
+    }
 
-        RegenerateManifestLocked();
+    private void ApplyPublication(Publication publication)
+    {
+        if (publication.StagedPack is not null)
+        {
+            if (Path.GetFileName(publication.StagedPack) != publication.StagedPack ||
+                !System.Text.RegularExpressions.Regex.IsMatch(publication.InstanceId ?? "", "^[a-z0-9_-]{1,64}$") ||
+                publication.Revision < 1 || publication.Index is null)
+                throw new InvalidDataException("Invalid publication artifact metadata.");
+            var directory = Path.Combine(_wwwrootDir, "packs", publication.InstanceId!);
+            Directory.CreateDirectory(directory);
+            var source = Path.Combine(StagingDirectory, publication.StagedPack);
+            var target = Path.Combine(directory, $"{publication.Revision}.mrpack");
+            // If DataDir and WwwRoot use different mounts, File.Move may copy.
+            // Copy only into a non-served temporary extension, then rename on
+            // the destination filesystem; never expose partially copied packs.
+            var transfer = Path.Combine(directory, $".{publication.Revision}-{publication.StagedPack}.publishing");
+            var expected = JsonSerializer.Deserialize<List<Instance>>(publication.Instances, JsonOptions)!
+                .Single(i => i.Id == publication.InstanceId).Pack!;
+            if (!File.Exists(target))
+            {
+                var transferred = false;
+                if (File.Exists(source))
+                {
+                    if (File.Exists(transfer)) File.Delete(transfer); // Owned, interrupted transfer.
+                    File.Move(source, transfer, overwrite: false);
+                    transferred = true;
+                    Checkpoint?.Invoke("after-transfer");
+                }
+                if (!transferred) VerifyPack(transfer, expected);
+                File.Move(transfer, target, overwrite: false);
+            }
+            else VerifyPack(target, expected);
+            Checkpoint?.Invoke("after-pack");
+            var indexPath = Path.Combine(directory, $"{publication.Revision}.files.json");
+            if (File.Exists(indexPath))
+            {
+                if (!File.ReadAllBytes(indexPath).SequenceEqual(publication.Index))
+                    throw new IOException("Publication index conflicts with existing bytes.");
+            }
+            else DurableFile.Write(indexPath, publication.Index);
+            Checkpoint?.Invoke("after-index");
+        }
+        DurableFile.Write(Path.Combine(_dataDir, "instances.json"), publication.Instances);
+        Checkpoint?.Invoke("after-instances");
+        // Two URL responses cannot be atomic. Clients must verify and retry a
+        // mismatched pair; the journal guarantees recovery after interruption.
+        DurableFile.Write(Path.Combine(_wwwrootDir, "manifest.json.sig"), publication.Signature);
+        Checkpoint?.Invoke("after-signature");
+        DurableFile.Write(Path.Combine(_wwwrootDir, "manifest.json"), publication.Manifest);
+        Checkpoint?.Invoke("after-manifest");
+        File.Delete(JournalPath);
+    }
+
+    private static void VerifyPack(string path, PackInfo expected)
+    {
+        if (!File.Exists(path)) throw new IOException("Publication pack is missing.");
+        using var existing = File.OpenRead(path);
+        var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(existing));
+        if (existing.Length != expected.Size || !digest.Equals(expected.Sha256, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Publication pack changed; refusing to advertise corrupted data.");
     }
 
     private Manifest BuildManifestLocked()
@@ -271,10 +464,9 @@ public sealed class InstanceStore
         // Build the exact bytes once, write manifest.json, then sign those same
         // bytes and write the detached signature. Both writes are atomic.
         var bytes = SerializeUtf8(BuildManifestLocked());
-        AtomicWriteBytes(Path.Combine(_wwwrootDir, "manifest.json"), bytes);
-
         var sigJson = _signer.Sign(bytes);
         AtomicWriteBytes(Path.Combine(_wwwrootDir, "manifest.json.sig"), Encoding.UTF8.GetBytes(sigJson));
+        AtomicWriteBytes(Path.Combine(_wwwrootDir, "manifest.json"), bytes);
     }
 
     private static byte[] SerializeUtf8<T>(T value)
@@ -282,9 +474,7 @@ public sealed class InstanceStore
 
     private static void AtomicWriteBytes(string path, byte[] bytes)
     {
-        var tmp = path + ".tmp";
-        File.WriteAllBytes(tmp, bytes);
-        File.Move(tmp, path, overwrite: true);
+        DurableFile.Write(path, bytes);
     }
 
     private static List<Instance> LoadInstances(string path)
@@ -296,12 +486,9 @@ public sealed class InstanceStore
         {
             return JsonSerializer.Deserialize<List<Instance>>(File.ReadAllText(path), JsonOptions) ?? [];
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            // Corrupt data file: start empty rather than crash the server; the
-            // admin can recreate instances. The corrupt file is left in place
-            // for inspection.
-            return [];
+            throw new InvalidDataException("instances.json is corrupt; refusing to overwrite existing data.", ex);
         }
     }
 
