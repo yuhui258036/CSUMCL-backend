@@ -15,6 +15,7 @@ public static class AdminRouter
 {
     private const string InstancesPrefix = "/admin/instances/";
     private const string UploadSuffix = "/upload";
+    private const string DeleteSuffix = "/delete";
 
     private static readonly Regex InstanceIdRegex = new("^[a-z0-9_-]{1,64}$", RegexOptions.Compiled);
 
@@ -134,7 +135,28 @@ public static class AdminRouter
         {
             var rest = path.Substring(InstancesPrefix.Length);
 
-            if (rest.EndsWith(UploadSuffix, StringComparison.Ordinal))
+            if (rest.EndsWith(DeleteSuffix, StringComparison.Ordinal))
+            {
+                var id = Uri.UnescapeDataString(rest.Substring(0, rest.Length - DeleteSuffix.Length));
+                if (id.Length > 0)
+                {
+                    if (method == "GET")
+                    {
+                        await GetDeleteFormAsync(context, auth, store, id);
+                        return;
+                    }
+
+                    if (method == "POST")
+                    {
+                        await PostDeleteAsync(context, auth, store, id);
+                        return;
+                    }
+
+                    await MethodNotAllowedAsync(context);
+                    return;
+                }
+            }
+            else if (rest.EndsWith(UploadSuffix, StringComparison.Ordinal))
             {
                 var id = Uri.UnescapeDataString(rest.Substring(0, rest.Length - UploadSuffix.Length));
                 if (id.Length > 0)
@@ -269,7 +291,7 @@ public static class AdminRouter
             rows.Append($"<div><span class=\"card-label\">大小 / 版本</span>{(published ? FormatSize(i.Pack!.Size) : "—")}<small>版本 {i.Revision}</small></div>");
             rows.Append($"<div><span class=\"card-label\">必须</span>{(i.Required ? "是" : "否")}</div>");
             rows.Append($"<div><span class=\"card-label\">发布状态</span><span class=\"tag {(published ? "success" : "pending")}\">{(published ? "已发布" : "待发布")}</span></div>");
-            rows.Append($"<div class=\"table-actions\"><a class=\"button secondary small\" href=\"/admin/instances/{idEnc}/upload\">上传新版本</a><a class=\"quiet small\" href=\"/admin/instances/{idEnc}\">编辑</a></div></article>");
+            rows.Append($"<div class=\"table-actions\"><a class=\"button secondary small\" href=\"/admin/instances/{idEnc}/upload\">上传新版本</a><a class=\"quiet small\" href=\"/admin/instances/{idEnc}\">编辑</a><a class=\"quiet small danger\" href=\"/admin/instances/{idEnc}/delete\">移除</a></div></article>");
         }
         var content = $$"""
 <div class="stats">
@@ -546,6 +568,53 @@ public static class AdminRouter
         };
 
         store.UpdateMetadata(updated);
+        Redirect(context, "/admin");
+    }
+
+    // ------------------------------------------------------------- Remove
+    private static async Task GetDeleteFormAsync(HttpContext context, AuthService auth, InstanceStore store, string id)
+    {
+        var instance = store.Get(id);
+        if (instance is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        var csrf = auth.EnsureCsrfCookie(context);
+        var idEnc = Uri.EscapeDataString(instance.Id);
+        var content = $$"""
+<div class="panel form-card">
+ <h2>从列表移除整合包</h2>
+ <p>确认将 <strong>{{H(instance.Name)}}</strong>（<code>{{H(instance.Id)}}</code>，当前版本 r{{instance.Revision}}）从资源清单中移除？</p>
+ <p class="notice">只会移除列表和签名清单，不会删除 <code>wwwroot/packs/{{H(instance.Id)}}/</code> 下已经发布的文件。需要恢复时可保留这些文件。</p>
+ <form method="post" action="/admin/instances/{{idEnc}}/delete">
+  <input type="hidden" name="_csrf" value="{{H(csrf)}}">
+  <div class="actions">
+   <button type="submit" class="secondary danger">确认移除</button>
+   <a href="/admin">取消</a>
+  </div>
+ </form>
+</div>
+""";
+        await WriteHtmlAsync(context, Layout("移除整合包", content));
+    }
+
+    private static async Task PostDeleteAsync(HttpContext context, AuthService auth, InstanceStore store, string id)
+    {
+        var form = await context.Request.ReadFormAsync();
+        if (!auth.ValidateCsrf(context, form[AuthService.CsrfFieldName]))
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+
+        if (!store.Delete(id))
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
         Redirect(context, "/admin");
     }
 

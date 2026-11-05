@@ -153,6 +153,24 @@ public sealed class InstanceStore
         }
     }
 
+    /// <summary>
+    /// Removes an instance from the list and regenerates the signed manifest.
+    /// Published pack files are intentionally kept on disk for recovery/re-add.
+    /// </summary>
+    public bool Delete(string id)
+    {
+        lock (_gate)
+        {
+            EnsureWritable();
+            var index = IndexOf(id);
+            if (index < 0)
+                return false;
+            _instances.RemoveAt(index);
+            SaveLocked();
+            return true;
+        }
+    }
+
     public void Reorder(string[] ids, string[] expected)
     {
         lock (_gate)

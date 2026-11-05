@@ -40,6 +40,7 @@ try
         TestFileIndexBuild();
         TestOverridesGroundTruth();
         TestInstanceStoreManifest();
+        TestDeleteInstance();
         TestDependencyMapping();
         TestUploadMetadata();
         TestStartupBackfill();
@@ -608,6 +609,46 @@ void TestInstanceStoreManifest()
     Check(File.Exists(Path.Combine(wwwroot, "manifest.json.sig")), "manifest.json.sig written");
 }
 
+void TestDeleteInstance()
+{
+    Section("InstanceStore remove from list");
+    var root = Path.Combine(tempRoot, "delete-store");
+    var data = Path.Combine(root, "data");
+    var web = Path.Combine(root, "web");
+    Directory.CreateDirectory(data);
+    Directory.CreateDirectory(web);
+    var keyPath = Path.Combine(root, "key.pem");
+    using (var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256))
+        File.WriteAllText(keyPath, ecdsa.ExportPkcs8PrivateKeyPem());
+    var store = new InstanceStore(data, web, "https://cdn.example.com", keyPath);
+    store.Create(new Instance
+    {
+        Id = "keep",
+        Name = "Keep",
+        Revision = 1,
+        Pack = new PackInfo { Url = "https://cdn.example.com/packs/keep/1.mrpack", Sha1 = "a", Sha256 = "b", Sha512 = "c", Size = 1 },
+    });
+    store.Create(new Instance
+    {
+        Id = "remove",
+        Name = "Remove",
+        Revision = 1,
+        Pack = new PackInfo { Url = "https://cdn.example.com/packs/remove/1.mrpack", Sha1 = "d", Sha256 = "e", Sha512 = "f", Size = 1 },
+    });
+    var packPath = Path.Combine(web, "packs", "remove", "1.mrpack");
+    Directory.CreateDirectory(Path.GetDirectoryName(packPath)!);
+    File.WriteAllText(packPath, "retain-me");
+
+    Check(store.Delete("remove"), "Delete returns true for a listed instance");
+    Check(store.Get("remove") is null, "deleted instance is absent from the store");
+    var manifest = JsonDocument.Parse(store.GetManifestJson()).RootElement;
+    var ids = manifest.GetProperty("instances").EnumerateArray()
+        .Select(i => i.GetProperty("id").GetString()).ToArray();
+    Check(ids.Contains("keep") && !ids.Contains("remove"), "signed manifest excludes the removed instance");
+    Check(File.Exists(packPath) && File.ReadAllText(packPath) == "retain-me",
+        "removing from the list keeps published pack files");
+    Check(!store.Delete("remove"), "second Delete returns false");
+}
 // --------------------------------------------------- dependency mapping tests
 
 string PackIndexWithDeps(string depsJson) => $$"""
