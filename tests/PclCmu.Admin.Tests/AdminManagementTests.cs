@@ -88,5 +88,23 @@ internal static class AdminManagementTests
             check(response.StatusCode == HttpStatusCode.Redirect && Stored().Single(i => i.Id == id).Server!.Port == (port.Length == 0 ? 25565 : int.Parse(port)),
                 $"{(create ? "create" : "edit")} accepts port {(port.Length == 0 ? "default 25565" : port)}");
         }
+        Console.WriteLine("\n== remove instance ==");
+        using (var content = Form("delete-test"))
+        using (var created = await admin.PostAsync("/admin/instances/new", content))
+            check(created.StatusCode == HttpStatusCode.Redirect, "remove fixture instance created");
+        using (var page = await admin.GetAsync("/admin/instances/delete-test/delete"))
+            check(page.StatusCode == HttpStatusCode.OK &&
+                  (await page.Content.ReadAsStringAsync()).Contains("\u786E\u8BA4\u79FB\u9664"),
+                "delete confirmation page is available");
+        using (var denied = await admin.PostAsync("/admin/instances/delete-test/delete",
+                   new FormUrlEncodedContent(new Dictionary<string, string> { ["_csrf"] = "wrong" })))
+            check(denied.StatusCode == HttpStatusCode.BadRequest, "delete requires CSRF");
+        using (var deleted = await admin.PostAsync("/admin/instances/delete-test/delete",
+                   new FormUrlEncodedContent(new Dictionary<string, string> { ["_csrf"] = csrf })))
+            check(deleted.StatusCode == HttpStatusCode.Redirect && Stored().All(i => i.Id != "delete-test"),
+                "delete removes instance from stored list");
+        var afterDelete = await publicClient.GetFromJsonAsync<Manifest>("/manifest.json");
+        check(afterDelete!.Instances.All(i => i.Id != "delete-test"),
+            "delete removes instance from signed client manifest");
     }
 }
