@@ -587,7 +587,7 @@ public static class AdminRouter
 <div class="panel form-card">
  <h2>从列表移除整合包</h2>
  <p>确认将 <strong>{{H(instance.Name)}}</strong>（<code>{{H(instance.Id)}}</code>，当前版本 r{{instance.Revision}}）从资源清单中移除？</p>
- <p class="notice">只会移除列表和签名清单，不会删除 <code>wwwroot/packs/{{H(instance.Id)}}/</code> 下已经发布的文件。需要恢复时可保留这些文件。</p>
+ <p class="err">同时会删除 <code>wwwroot/packs/{{H(instance.Id)}}/</code> 下所有已发布的整合包和文件索引，删除后无法恢复。</p>
  <form method="post" action="/admin/instances/{{idEnc}}/delete">
   <input type="hidden" name="_csrf" value="{{H(csrf)}}">
   <div class="actions">
@@ -609,9 +609,24 @@ public static class AdminRouter
             return;
         }
 
-        if (!store.Delete(id))
+        var result = store.Delete(id);
+        if (!result.Removed)
         {
             context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        if (result.FileCleanupError is not null)
+        {
+            var content = $"""
+<div class="panel form-card">
+ <h2>已从列表移除，但文件清理失败</h2>
+ <p class="err">{H(result.FileCleanupError)}</p>
+ <p>资源清单已更新；请检查 <code>wwwroot/packs/{H(id)}/</code> 是否仍存在，并在确认文件不再被占用后手动清理。</p>
+ <div class="actions"><a href="/admin">返回概览</a></div>
+</div>
+""";
+            await WriteHtmlAsync(context, Layout("移除完成", content));
             return;
         }
 

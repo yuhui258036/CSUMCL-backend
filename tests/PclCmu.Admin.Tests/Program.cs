@@ -639,15 +639,16 @@ void TestDeleteInstance()
     Directory.CreateDirectory(Path.GetDirectoryName(packPath)!);
     File.WriteAllText(packPath, "retain-me");
 
-    Check(store.Delete("remove"), "Delete returns true for a listed instance");
+    var deleted = store.Delete("remove");
+    Check(deleted.Removed && deleted.FileCleanupError is null, "Delete removes a listed instance and its files");
     Check(store.Get("remove") is null, "deleted instance is absent from the store");
     var manifest = JsonDocument.Parse(store.GetManifestJson()).RootElement;
     var ids = manifest.GetProperty("instances").EnumerateArray()
         .Select(i => i.GetProperty("id").GetString()).ToArray();
     Check(ids.Contains("keep") && !ids.Contains("remove"), "signed manifest excludes the removed instance");
-    Check(File.Exists(packPath) && File.ReadAllText(packPath) == "retain-me",
-        "removing from the list keeps published pack files");
-    Check(!store.Delete("remove"), "second Delete returns false");
+    Check(!File.Exists(packPath) && !Directory.Exists(Path.GetDirectoryName(packPath)!),
+        "removing from the list deletes the published pack directory");
+    Check(!store.Delete("remove").Removed, "second Delete returns Removed=false");
 }
 // --------------------------------------------------- dependency mapping tests
 

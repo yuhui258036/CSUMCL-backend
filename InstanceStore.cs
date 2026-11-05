@@ -9,6 +9,8 @@ namespace PclCmu.Admin;
 /// regenerates <c>wwwroot/manifest.json</c> atomically (write-to-temp + rename)
 /// under a lock.
 /// </summary>
+public sealed record InstanceDeleteResult(bool Removed, string? FileCleanupError);
+
 public sealed class InstanceStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -154,20 +156,46 @@ public sealed class InstanceStore
     }
 
     /// <summary>
-    /// Removes an instance from the list and regenerates the signed manifest.
-    /// Published pack files are intentionally kept on disk for recovery/re-add.
+    /// Removes an instance from the list, regenerates the signed manifest, then
+    /// deletes <c>wwwroot/packs/&lt;id&gt;/</c>. The metadata commit happens first so
+    /// the public manifest never advertises a pack whose files are being removed.
+    /// A file cleanup failure is reported separately; the instance stays removed.
     /// </summary>
-    public bool Delete(string id)
+    public InstanceDeleteResult Delete(string id)
     {
         lock (_gate)
         {
             EnsureWritable();
             var index = IndexOf(id);
             if (index < 0)
-                return false;
+                return new InstanceDeleteResult(false, null);
+
             _instances.RemoveAt(index);
             SaveLocked();
-            return true;
+            return new InstanceDeleteResult(true, DeletePackDirectory(id));
+        }
+    }
+
+    private string? DeletePackDirectory(string id)
+    {
+        try
+        {
+            var packsRoot = Path.GetFullPath(Path.Combine(_wwwrootDir, "packs"));
+            var target = Path.GetFullPath(Path.Combine(packsRoot, id));
+            var relative = Path.GetRelativePath(packsRoot, target);
+            if (relative is "." or "" || relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+                return "拒绝删除 packs 根目录之外的路径。";
+            if (!Directory.Exists(target))
+                return null;
+            if ((File.GetAttributes(target) & FileAttributes.ReparsePoint) != 0)
+                return "目标为链接目录，已拒绝删除。";
+            Directory.Delete(target, recursive: true);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            Console.Error.WriteLine($"[delete] instance \"{id}\" metadata removed but pack cleanup failed: {ex.Message}");
+            return ex.Message;
         }
     }
 
